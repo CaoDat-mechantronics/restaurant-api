@@ -2,38 +2,64 @@ import asyncio
 import json
 import os
 import ssl
-import sqlite3
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
+import firebase_admin
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from firebase_admin import credentials, db
 from pydantic import BaseModel, Field
 
 
 # =========================================================
-# CẤU HÌNH
+# LOAD ENV
 # =========================================================
 
-DATABASE_NAME = "restaurant.db"
-TOTAL_TABLES = 12
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-# Có thể thay trực tiếp 4 giá trị mặc định dưới đây,
-# hoặc đặt biến môi trường MQTT_HOST/MQTT_PORT/MQTT_USERNAME/MQTT_PASSWORD.
-MQTT_HOST = os.getenv("MQTT_HOST")
+
+# =========================================================
+# CẤU HÌNH CHUNG
+# =========================================================
+
+TOTAL_TABLES = int(os.getenv("TOTAL_TABLES", "10"))
+
+# Firebase Realtime Database
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
+FIREBASE_ROOT_PATH = os.getenv("FIREBASE_ROOT_PATH", "restaurant").strip().strip("/")
+FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+FIREBASE_SERVICE_ACCOUNT_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "").strip()
+
+# MQTT / HiveMQ
+MQTT_HOST = os.getenv("MQTT_HOST", "").strip()
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "").strip()
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "").strip()
 
-MQTT_CONFIGURED = (
+MQTT_CONFIGURED = bool(
     MQTT_HOST
-    and not MQTT_HOST.startswith("YOUR_")
     and MQTT_USERNAME
-    and not MQTT_USERNAME.startswith("YOUR_")
     and MQTT_PASSWORD
-    and not MQTT_PASSWORD.startswith("YOUR_")
 )
+
+# CORS. Ví dụ:
+# CORS_ORIGINS=https://your-frontend.pages.dev,https://example.com
+# Để * trong giai đoạn phát triển.
+CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "*").strip()
+if CORS_ORIGINS_RAW == "*":
+    CORS_ORIGINS = ["*"]
+else:
+    CORS_ORIGINS = [
+        origin.strip()
+        for origin in CORS_ORIGINS_RAW.split(",")
+        if origin.strip()
+    ]
 
 
 # =========================================================
@@ -75,154 +101,278 @@ class TableItemsUpdate(BaseModel):
 
 
 # =========================================================
-# SQLITE
+# FIREBASE INITIALIZATION
 # =========================================================
 
-def get_connection():
-    conn = sqlite3.connect(
-        DATABASE_NAME,
-        timeout=10,
-        check_same_thread=False,
-    )
-    conn.row_factory = sqlite3.Row
-    return conn
+def init_firebase():
+    """
+    Hỗ trợ 3 cách credentials, theo thứ tự ưu tiên:
 
+    1) FIREBASE_SERVICE_ACCOUNT_JSON
+       - Dùng tốt trên Render.
+       - Giá trị là toàn bộ JSON service account ở dạng một dòng.
 
-def table_columns(conn, table_name: str) -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
+    2) FIREBASE_SERVICE_ACCOUNT_PATH
+       - Dùng tốt ở local.
+       - Ví dụ: serviceAccountKey.json
 
-
-def init_database():
-    conn = get_connection()
-
+    3) GOOGLE_APPLICATION_CREDENTIALS / Application Default Credentials
+       - Dùng khi môi trường đã cấu hình ADC.
+    """
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS order_items
-            (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_code TEXT NOT NULL,
-                table_number INTEGER NOT NULL,
-                food_name TEXT NOT NULL,
-                quantity INTEGER NOT NULL,
-                unit_price INTEGER NOT NULL,
-                delivered INTEGER NOT NULL DEFAULT 0,
-                note TEXT DEFAULT '',
-                cooking_status INTEGER NOT NULL DEFAULT 0,
-                assigned_robot INTEGER,
-                robot_dispatched INTEGER NOT NULL DEFAULT 0,
-                delivery_status TEXT NOT NULL DEFAULT 'waiting',
-                dispatch_command_id TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        return firebase_admin.get_app()
+    except ValueError:
+        pass
 
-                CHECK (table_number > 0),
-                CHECK (quantity > 0),
-                CHECK (unit_price > 0),
-                CHECK (delivered IN (0, 1))
+    if not FIREBASE_DATABASE_URL:
+        raise RuntimeError(
+            "Thiếu FIREBASE_DATABASE_URL. Hãy cấu hình trong .env hoặc Render Environment."
+        )
+
+    credential = None
+
+    if FIREBASE_SERVICE_ACCOUNT_JSON:
+        try:
+            service_account_info = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                "FIREBASE_SERVICE_ACCOUNT_JSON không phải JSON hợp lệ."
+            ) from error
+
+        credential = credentials.Certificate(service_account_info)
+
+    elif FIREBASE_SERVICE_ACCOUNT_PATH:
+        service_account_path = Path(FIREBASE_SERVICE_ACCOUNT_PATH)
+
+        if not service_account_path.is_absolute():
+            service_account_path = BASE_DIR / service_account_path
+
+        if not service_account_path.exists():
+            raise RuntimeError(
+                f"Không tìm thấy Firebase service account: {service_account_path}"
             )
-            """
-        )
 
-        # Migration cho database cũ đã tồn tại.
-        columns = table_columns(conn, "order_items")
+        credential = credentials.Certificate(str(service_account_path))
 
-        migrations = [
-            ("cooking_status", "INTEGER NOT NULL DEFAULT 0"),
-            ("assigned_robot", "INTEGER"),
-            ("robot_dispatched", "INTEGER NOT NULL DEFAULT 0"),
-            ("delivery_status", "TEXT NOT NULL DEFAULT 'waiting'"),
-            ("dispatch_command_id", "TEXT"),
-        ]
+    else:
+        # credentials.ApplicationDefault() sẽ sử dụng ADC, bao gồm
+        # GOOGLE_APPLICATION_CREDENTIALS nếu biến này được cấu hình.
+        credential = credentials.ApplicationDefault()
 
-        for column_name, definition in migrations:
-            if column_name not in columns:
-                conn.execute(
-                    f"ALTER TABLE order_items ADD COLUMN {column_name} {definition}"
-                )
+    app_instance = firebase_admin.initialize_app(
+        credential,
+        {
+            "databaseURL": FIREBASE_DATABASE_URL,
+        },
+    )
 
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_order_items_table_number
-            ON order_items(table_number)
-            """
-        )
+    print(f"[FIREBASE] Connected: {FIREBASE_DATABASE_URL}")
+    print(f"[FIREBASE] Root path: /{FIREBASE_ROOT_PATH}")
 
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_order_items_order_code
-            ON order_items(order_code)
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_order_items_dispatch_command_id
-            ON order_items(dispatch_command_id)
-            """
-        )
-
-        conn.commit()
-
-    finally:
-        conn.close()
+    return app_instance
 
 
-ORDER_COLUMNS = """
-    id,
-    order_code,
-    table_number,
-    food_name,
-    quantity,
-    unit_price,
-    delivered,
-    note,
-    cooking_status,
-    assigned_robot,
-    robot_dispatched,
-    delivery_status,
-    dispatch_command_id,
-    created_at
-"""
+def firebase_path(child_path: str = "") -> str:
+    child_path = str(child_path or "").strip().strip("/")
+
+    if FIREBASE_ROOT_PATH and child_path:
+        return f"/{FIREBASE_ROOT_PATH}/{child_path}"
+
+    if FIREBASE_ROOT_PATH:
+        return f"/{FIREBASE_ROOT_PATH}"
+
+    if child_path:
+        return f"/{child_path}"
+
+    return "/"
 
 
-def row_to_dict(row):
+def root_ref():
+    return db.reference(firebase_path())
+
+
+def order_items_ref():
+    return db.reference(firebase_path("order_items"))
+
+
+def meta_ref():
+    return db.reference(firebase_path("meta"))
+
+
+def item_ref(item_id: int):
+    return db.reference(firebase_path(f"order_items/{int(item_id)}"))
+
+
+# =========================================================
+# FIREBASE DATA HELPERS
+# =========================================================
+
+def firebase_item_to_dict(item_id, data):
+    data = data or {}
+
+    quantity = int(data.get("quantity") or 0)
+    unit_price = int(data.get("unit_price") or 0)
+
+    assigned_robot = data.get("assigned_robot")
+    if assigned_robot is not None:
+        try:
+            assigned_robot = int(assigned_robot)
+        except (TypeError, ValueError):
+            assigned_robot = None
+
     return {
-        "id": row["id"],
-        "order_code": row["order_code"],
-        "table_number": row["table_number"],
-        "food_name": row["food_name"],
-        "quantity": row["quantity"],
-        "unit_price": row["unit_price"],
-        "delivered": bool(row["delivered"]),
-        "note": row["note"] or "",
-        "cooking_status": int(row["cooking_status"] or 0),
-        "assigned_robot": row["assigned_robot"],
-        "robot_dispatched": bool(row["robot_dispatched"]),
-        "delivery_status": row["delivery_status"] or "waiting",
-        "dispatch_command_id": row["dispatch_command_id"],
-        "created_at": row["created_at"],
-        "item_total": row["quantity"] * row["unit_price"],
+        "id": int(data.get("id") or item_id),
+        "order_code": str(data.get("order_code") or ""),
+        "table_number": int(data.get("table_number") or 0),
+        "food_name": str(data.get("food_name") or ""),
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "delivered": bool(data.get("delivered", False)),
+        "note": str(data.get("note") or ""),
+        "cooking_status": int(data.get("cooking_status") or 0),
+        "assigned_robot": assigned_robot,
+        "robot_dispatched": bool(data.get("robot_dispatched", False)),
+        "delivery_status": str(data.get("delivery_status") or "waiting"),
+        "dispatch_command_id": data.get("dispatch_command_id"),
+        "created_at": str(data.get("created_at") or ""),
+        "item_total": quantity * unit_price,
     }
 
 
-def get_table_summary(conn, table_number: int):
-    row = conn.execute(
-        """
-        SELECT
-            COUNT(*) AS item_count,
-            COALESCE(MAX(id), 0) AS max_item_id
-        FROM order_items
-        WHERE table_number = ?
-        """,
-        (table_number,),
-    ).fetchone()
+def get_all_items_raw() -> dict:
+    data = order_items_ref().get()
+
+    if not isinstance(data, dict):
+        return {}
+
+    return data
+
+
+def get_all_items() -> list[dict]:
+    data = get_all_items_raw()
+
+    items = [
+        firebase_item_to_dict(item_id, item_data)
+        for item_id, item_data in data.items()
+        if isinstance(item_data, dict)
+    ]
+
+    items.sort(key=lambda item: item["id"], reverse=True)
+    return items
+
+
+def get_item(item_id: int):
+    data = item_ref(item_id).get()
+
+    if not isinstance(data, dict):
+        return None
+
+    return firebase_item_to_dict(item_id, data)
+
+
+def get_items_by_table(table_number: int) -> list[dict]:
+    snapshot = (
+        order_items_ref()
+        .order_by_child("table_number")
+        .equal_to(int(table_number))
+        .get()
+    )
+
+    if not isinstance(snapshot, dict):
+        return []
+
+    items = [
+        firebase_item_to_dict(item_id, item_data)
+        for item_id, item_data in snapshot.items()
+        if isinstance(item_data, dict)
+    ]
+
+    items.sort(key=lambda item: item["id"])
+    return items
+
+
+def get_items_by_order_code(order_code: str) -> list[dict]:
+    snapshot = (
+        order_items_ref()
+        .order_by_child("order_code")
+        .equal_to(str(order_code))
+        .get()
+    )
+
+    if not isinstance(snapshot, dict):
+        return []
+
+    items = [
+        firebase_item_to_dict(item_id, item_data)
+        for item_id, item_data in snapshot.items()
+        if isinstance(item_data, dict)
+    ]
+
+    items.sort(key=lambda item: item["id"])
+    return items
+
+
+def get_table_summary(table_number: int):
+    items = get_items_by_table(table_number)
 
     return {
-        "table_number": table_number,
-        "item_count": int(row["item_count"] or 0),
-        "max_item_id": int(row["max_item_id"] or 0),
+        "table_number": int(table_number),
+        "item_count": len(items),
+        "max_item_id": max((item["id"] for item in items), default=0),
     }
+
+
+def ensure_item_counter():
+    """
+    Đảm bảo /meta/next_item_id không nhỏ hơn ID lớn nhất đang có.
+    Điều này giúp tránh đụng ID nếu Firebase đã có dữ liệu trước đó.
+    """
+    raw_items = get_all_items_raw()
+
+    max_existing_id = 0
+    for item_id, item_data in raw_items.items():
+        try:
+            candidate = int(
+                item_data.get("id", item_id)
+                if isinstance(item_data, dict)
+                else item_id
+            )
+            max_existing_id = max(max_existing_id, candidate)
+        except (TypeError, ValueError):
+            continue
+
+    counter_ref = meta_ref().child("next_item_id")
+
+    def update_counter(current):
+        try:
+            current_value = int(current or 0)
+        except (TypeError, ValueError):
+            current_value = 0
+
+        return max(current_value, max_existing_id)
+
+    value = counter_ref.transaction(update_counter)
+    print(f"[FIREBASE] next_item_id = {value}")
+
+
+def reserve_item_ids(count: int) -> list[int]:
+    if count <= 0:
+        return []
+
+    counter_ref = meta_ref().child("next_item_id")
+
+    def increment(current):
+        try:
+            current_value = int(current or 0)
+        except (TypeError, ValueError):
+            current_value = 0
+
+        return current_value + count
+
+    final_value = int(counter_ref.transaction(increment))
+    first_value = final_value - count + 1
+
+    return list(range(first_value, final_value + 1))
 
 
 # =========================================================
@@ -260,7 +410,7 @@ cooking_task = None
 
 
 def broadcast_from_mqtt_thread(data: dict):
-    """MQTT callback chạy ở thread của Paho, nên chuyển coroutine về loop FastAPI."""
+    """MQTT callback chạy ở thread Paho, chuyển coroutine về loop FastAPI."""
     global fastapi_loop
 
     if fastapi_loop is None or not fastapi_loop.is_running():
@@ -324,56 +474,41 @@ def on_mqtt_message(client, userdata, message):
         robot_number = int(payload["robot"])
         command_id = str(payload.get("command_id") or "")
 
-        conn = get_connection()
+        item = get_item(item_id)
 
-        try:
-            item = conn.execute(
-                f"""
-                SELECT {ORDER_COLUMNS}
-                FROM order_items
-                WHERE id = ?
-                """,
-                (item_id,),
-            ).fetchone()
+        if item is None:
+            print(f"[MQTT] Bỏ qua: không còn item_id={item_id}")
+            return
 
-            if item is None:
-                print(f"[MQTT] Bỏ qua: không còn item_id={item_id}")
-                return
+        if int(item["table_number"]) != table_number:
+            print("[MQTT] Bỏ qua: số bàn không khớp")
+            return
 
-            if int(item["table_number"]) != table_number:
-                print("[MQTT] Bỏ qua: số bàn không khớp")
-                return
+        if (
+            item["assigned_robot"] is None
+            or int(item["assigned_robot"]) != robot_number
+        ):
+            print("[MQTT] Bỏ qua: robot không khớp")
+            return
 
-            if item["assigned_robot"] is None or int(item["assigned_robot"]) != robot_number:
-                print("[MQTT] Bỏ qua: robot không khớp")
-                return
+        expected_command_id = str(item.get("dispatch_command_id") or "")
+        if expected_command_id and command_id != expected_command_id:
+            print("[MQTT] Bỏ qua: command_id cũ hoặc không hợp lệ")
+            return
 
-            expected_command_id = str(item["dispatch_command_id"] or "")
-            if expected_command_id and command_id != expected_command_id:
-                print("[MQTT] Bỏ qua: command_id cũ hoặc không hợp lệ")
-                return
+        # QoS 1 có thể gửi lặp. Nếu đã delivered thì xử lý idempotent.
+        if bool(item["delivered"]):
+            print(f"[MQTT] item_id={item_id} đã delivered trước đó")
+            return
 
-            # QoS 1 có thể gửi lặp. Nếu đã delivered thì xử lý idempotent.
-            if bool(item["delivered"]):
-                print(f"[MQTT] item_id={item_id} đã delivered trước đó")
-                return
+        item_ref(item_id).update(
+            {
+                "delivered": True,
+                "delivery_status": "delivered",
+            }
+        )
 
-            conn.execute(
-                """
-                UPDATE order_items
-                SET
-                    delivered = 1,
-                    delivery_status = 'delivered'
-                WHERE id = ?
-                """,
-                (item_id,),
-            )
-            conn.commit()
-
-            food_name = item["food_name"]
-
-        finally:
-            conn.close()
+        food_name = item["food_name"]
 
         print(
             f"[MQTT] ✓ Robot {robot_number} đã giao {food_name} "
@@ -412,7 +547,7 @@ def publish_robot_command(topic: str, payload: dict):
             status_code=503,
             detail=(
                 "HiveMQ chưa được cấu hình. Hãy đặt MQTT_HOST, MQTT_USERNAME "
-                "và MQTT_PASSWORD trong main.py hoặc biến môi trường."
+                "và MQTT_PASSWORD trong biến môi trường."
             ),
         )
 
@@ -445,6 +580,27 @@ def publish_robot_command(topic: str, payload: dict):
 # TỰ ĐỘNG CHUYỂN TRẠNG THÁI NẤU 0 -> 1 -> 2
 # =========================================================
 
+def parse_created_at(value: str):
+    if not value:
+        return None
+
+    try:
+        normalized = str(value).strip()
+
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(normalized)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (ValueError, TypeError):
+        return None
+
+
 def update_cooking_statuses_once():
     """
     0 - dưới 5 giây: chưa nấu
@@ -453,62 +609,57 @@ def update_cooking_statuses_once():
 
     Trả về các item vừa đổi trạng thái để push WebSocket.
     """
-    conn = get_connection()
+    raw_items = get_all_items_raw()
+    now = datetime.now(timezone.utc)
+
     changes = []
+    updates = {}
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-                id,
-                table_number,
-                food_name,
-                cooking_status,
-                CAST(strftime('%s', 'now') AS INTEGER)
-                    - CAST(strftime('%s', created_at) AS INTEGER) AS age_seconds
-            FROM order_items
-            WHERE cooking_status < 2
-            """
-        ).fetchall()
+    for item_key, data in raw_items.items():
+        if not isinstance(data, dict):
+            continue
 
-        for row in rows:
-            age_seconds = max(0, int(row["age_seconds"] or 0))
-            old_status = int(row["cooking_status"] or 0)
+        try:
+            item_id = int(data.get("id") or item_key)
+            old_status = int(data.get("cooking_status") or 0)
+        except (TypeError, ValueError):
+            continue
 
-            if age_seconds >= 10:
-                new_status = 2
-            elif age_seconds >= 5:
-                new_status = 1
-            else:
-                new_status = 0
+        if old_status >= 2:
+            continue
 
-            if new_status == old_status:
-                continue
+        created_at = parse_created_at(data.get("created_at"))
 
-            conn.execute(
-                """
-                UPDATE order_items
-                SET cooking_status = ?
-                WHERE id = ?
-                """,
-                (new_status, row["id"]),
-            )
+        if created_at is None:
+            continue
 
-            changes.append(
-                {
-                    "type": "item_cooking_status",
-                    "item_id": int(row["id"]),
-                    "table": int(row["table_number"]),
-                    "food_name": row["food_name"],
-                    "cooking_status": new_status,
-                }
-            )
+        age_seconds = max(0.0, (now - created_at).total_seconds())
 
-        if changes:
-            conn.commit()
+        if age_seconds >= 10:
+            new_status = 2
+        elif age_seconds >= 5:
+            new_status = 1
+        else:
+            new_status = 0
 
-    finally:
-        conn.close()
+        if new_status == old_status:
+            continue
+
+        # Nested multi-location update: {"25/cooking_status": 1, ...}
+        updates[f"{item_key}/cooking_status"] = new_status
+
+        changes.append(
+            {
+                "type": "item_cooking_status",
+                "item_id": item_id,
+                "table": int(data.get("table_number") or 0),
+                "food_name": str(data.get("food_name") or ""),
+                "cooking_status": new_status,
+            }
+        )
+
+    if updates:
+        order_items_ref().update(updates)
 
     return changes
 
@@ -537,7 +688,9 @@ async def cooking_status_worker():
 async def lifespan(app: FastAPI):
     global fastapi_loop, cooking_task
 
-    init_database()
+    init_firebase()
+    await asyncio.to_thread(ensure_item_counter)
+
     fastapi_loop = asyncio.get_running_loop()
 
     if MQTT_CONFIGURED:
@@ -575,14 +728,14 @@ async def lifespan(app: FastAPI):
 # =========================================================
 
 app = FastAPI(
-    title="Restaurant Order API + MQTT + WebSocket",
-    version="3.0.0",
+    title="Restaurant Order API + Firebase + MQTT + WebSocket",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -597,6 +750,10 @@ app.add_middleware(
 def home():
     return {
         "message": "Restaurant API đang hoạt động",
+        "database": "Firebase Realtime Database",
+        "firebase_database_url": FIREBASE_DATABASE_URL,
+        "firebase_root_path": FIREBASE_ROOT_PATH,
+        "total_tables": TOTAL_TABLES,
         "mqtt_configured": MQTT_CONFIGURED,
         "mqtt_connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
     }
@@ -627,8 +784,6 @@ async def dashboard_websocket(websocket: WebSocket):
     await manager.connect(websocket)
 
     try:
-        # Client có thể không gửi gì. receive_text() chỉ giữ endpoint sống
-        # và giúp phát hiện disconnect.
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
@@ -640,6 +795,44 @@ async def dashboard_websocket(websocket: WebSocket):
 # =========================================================
 # POST /orders - ĐẶT MÓN
 # =========================================================
+
+def create_order_in_firebase(order: OrderCreate):
+    order_code = uuid.uuid4().hex[:8].upper()
+    item_ids = reserve_item_ids(len(order.foods))
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    firebase_updates = {}
+    items = []
+
+    for item_id, food in zip(item_ids, order.foods):
+        item_data = {
+            "id": item_id,
+            "order_code": order_code,
+            "table_number": order.tableNumber,
+            "food_name": food.name,
+            "quantity": food.quantity,
+            "unit_price": food.price,
+            "delivered": False,
+            "note": food.note,
+            "cooking_status": 0,
+            "assigned_robot": None,
+            "robot_dispatched": False,
+            "delivery_status": "waiting",
+            "dispatch_command_id": None,
+            "created_at": now_iso,
+        }
+
+        firebase_updates[str(item_id)] = item_data
+        items.append(firebase_item_to_dict(item_id, item_data))
+
+    # Ghi toàn bộ món của order trong một update.
+    order_items_ref().update(firebase_updates)
+
+    total = sum(item["item_total"] for item in items)
+    summary = get_table_summary(order.tableNumber)
+
+    return order_code, items, total, summary
+
 
 @app.post("/orders", status_code=201)
 async def create_order(order: OrderCreate):
@@ -655,61 +848,16 @@ async def create_order(order: OrderCreate):
             detail=f"Chỉ hỗ trợ Bàn 1 đến Bàn {TOTAL_TABLES}.",
         )
 
-    order_code = uuid.uuid4().hex[:8].upper()
-    conn = get_connection()
-
     try:
-        for food in order.foods:
-            conn.execute(
-                """
-                INSERT INTO order_items
-                (
-                    order_code,
-                    table_number,
-                    food_name,
-                    quantity,
-                    unit_price,
-                    delivered,
-                    note,
-                    cooking_status,
-                    assigned_robot,
-                    robot_dispatched,
-                    delivery_status,
-                    dispatch_command_id
-                )
-                VALUES (?, ?, ?, ?, ?, 0, ?, 0, NULL, 0, 'waiting', NULL)
-                """,
-                (
-                    order_code,
-                    order.tableNumber,
-                    food.name,
-                    food.quantity,
-                    food.price,
-                    food.note,
-                ),
-            )
-
-        conn.commit()
-
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE order_code = ?
-            ORDER BY id ASC
-            """,
-            (order_code,),
-        ).fetchall()
-
-        items = [row_to_dict(row) for row in rows]
-        total = sum(item["item_total"] for item in items)
-        summary = get_table_summary(conn, order.tableNumber)
-
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        order_code, items, total, summary = await asyncio.to_thread(
+            create_order_in_firebase,
+            order,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Không thể ghi đơn hàng vào Firebase: {error}",
+        ) from error
 
     await manager.broadcast(
         {
@@ -736,20 +884,7 @@ async def create_order(order: OrderCreate):
 
 @app.get("/orders")
 def get_all_orders():
-    conn = get_connection()
-
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            ORDER BY id DESC
-            """
-        ).fetchall()
-    finally:
-        conn.close()
-
-    return [row_to_dict(row) for row in rows]
+    return get_all_items()
 
 
 # =========================================================
@@ -758,45 +893,35 @@ def get_all_orders():
 
 @app.get("/orders/tables/status")
 def get_table_statuses():
-    conn = get_connection()
+    items = get_all_items()
 
-    try:
-        rows = conn.execute(
-            """
-            SELECT
-                table_number,
-                COUNT(*) AS item_count,
-                COALESCE(MAX(id), 0) AS max_item_id
-            FROM order_items
-            GROUP BY table_number
-            """
-        ).fetchall()
-
-        by_table = {
-            int(row["table_number"]): {
-                "table_number": int(row["table_number"]),
-                "item_count": int(row["item_count"] or 0),
-                "max_item_id": int(row["max_item_id"] or 0),
-            }
-            for row in rows
+    by_table = {
+        table_number: {
+            "table_number": table_number,
+            "item_count": 0,
+            "max_item_id": 0,
         }
+        for table_number in range(1, TOTAL_TABLES + 1)
+    }
 
-        return {
-            "tables": [
-                by_table.get(
-                    table_number,
-                    {
-                        "table_number": table_number,
-                        "item_count": 0,
-                        "max_item_id": 0,
-                    },
-                )
-                for table_number in range(1, TOTAL_TABLES + 1)
-            ]
-        }
+    for item in items:
+        table_number = int(item["table_number"])
 
-    finally:
-        conn.close()
+        if table_number not in by_table:
+            continue
+
+        by_table[table_number]["item_count"] += 1
+        by_table[table_number]["max_item_id"] = max(
+            by_table[table_number]["max_item_id"],
+            int(item["id"]),
+        )
+
+    return {
+        "tables": [
+            by_table[table_number]
+            for table_number in range(1, TOTAL_TABLES + 1)
+        ]
+    }
 
 
 # =========================================================
@@ -808,22 +933,7 @@ def get_orders_by_table(table_number: int):
     if table_number <= 0 or table_number > TOTAL_TABLES:
         raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
-    conn = get_connection()
-
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE table_number = ?
-            ORDER BY id ASC
-            """,
-            (table_number,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    items = [row_to_dict(row) for row in rows]
+    items = get_items_by_table(table_number)
 
     return {
         "table_number": table_number,
@@ -838,25 +948,18 @@ def get_orders_by_table(table_number: int):
 
 @app.get("/orders/table/{table_number}/pending")
 def get_pending_orders_by_table(table_number: int):
-    conn = get_connection()
+    if table_number <= 0 or table_number > TOTAL_TABLES:
+        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE table_number = ?
-              AND delivered = 0
-            ORDER BY id ASC
-            """,
-            (table_number,),
-        ).fetchall()
-    finally:
-        conn.close()
+    items = [
+        item
+        for item in get_items_by_table(table_number)
+        if not item["delivered"]
+    ]
 
     return {
         "table_number": table_number,
-        "items": [row_to_dict(row) for row in rows],
+        "items": items,
     }
 
 
@@ -866,25 +969,10 @@ def get_pending_orders_by_table(table_number: int):
 
 @app.get("/orders/code/{order_code}")
 def get_order_by_code(order_code: str):
-    conn = get_connection()
+    items = get_items_by_order_code(order_code)
 
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE order_code = ?
-            ORDER BY id ASC
-            """,
-            (order_code,),
-        ).fetchall()
-    finally:
-        conn.close()
-
-    if len(rows) == 0:
+    if len(items) == 0:
         raise HTTPException(status_code=404, detail="Không tìm thấy mã đặt món.")
-
-    items = [row_to_dict(row) for row in rows]
 
     return {
         "order_code": order_code,
@@ -896,54 +984,42 @@ def get_order_by_code(order_code: str):
 
 # =========================================================
 # PATCH /order-items/{item_id}/delivered
-# Cho phép đánh dấu thủ công khi cần.
 # =========================================================
+
+def update_delivery_status_in_firebase(item_id: int, delivered: bool):
+    item = get_item(item_id)
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+
+    delivery_status = "delivered" if delivered else (
+        "dispatched" if bool(item["robot_dispatched"]) else "waiting"
+    )
+
+    item_ref(item_id).update(
+        {
+            "delivered": bool(delivered),
+            "delivery_status": delivery_status,
+        }
+    )
+
+    return item, delivery_status
+
 
 @app.patch("/order-items/{item_id}/delivered")
 async def update_delivery_status(item_id: int, data: DeliveryUpdate):
-    conn = get_connection()
-
-    try:
-        item = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE id = ?
-            """,
-            (item_id,),
-        ).fetchone()
-
-        if item is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy món.")
-
-        delivery_status = "delivered" if data.delivered else (
-            "dispatched" if bool(item["robot_dispatched"]) else "waiting"
-        )
-
-        conn.execute(
-            """
-            UPDATE order_items
-            SET
-                delivered = ?,
-                delivery_status = ?
-            WHERE id = ?
-            """,
-            (1 if data.delivered else 0, delivery_status, item_id),
-        )
-        conn.commit()
-
-        table_number = int(item["table_number"])
-        food_name = item["food_name"]
-
-    finally:
-        conn.close()
+    item, delivery_status = await asyncio.to_thread(
+        update_delivery_status_in_firebase,
+        item_id,
+        data.delivered,
+    )
 
     await manager.broadcast(
         {
             "type": "item_delivery_changed",
             "item_id": item_id,
-            "table": table_number,
-            "food_name": food_name,
+            "table": int(item["table_number"]),
+            "food_name": item["food_name"],
             "delivered": data.delivered,
             "delivery_status": delivery_status,
         }
@@ -959,41 +1035,30 @@ async def update_delivery_status(item_id: int, data: DeliveryUpdate):
 
 # =========================================================
 # PATCH /order-items/{item_id}/quantity
-# Giữ lại để tương thích frontend cũ.
+# Giữ tương thích frontend cũ.
 # =========================================================
+
+def update_quantity_in_firebase(item_id: int, quantity: int):
+    item = get_item(item_id)
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+
+    item_ref(item_id).update({"quantity": quantity})
+
+    summary = get_table_summary(int(item["table_number"]))
+    item_total = quantity * int(item["unit_price"])
+
+    return item, summary, item_total
+
 
 @app.patch("/order-items/{item_id}/quantity")
 async def update_quantity(item_id: int, data: QuantityUpdate):
-    conn = get_connection()
-
-    try:
-        item = conn.execute(
-            """
-            SELECT id, table_number, unit_price, food_name
-            FROM order_items
-            WHERE id = ?
-            """,
-            (item_id,),
-        ).fetchone()
-
-        if item is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy món.")
-
-        conn.execute(
-            """
-            UPDATE order_items
-            SET quantity = ?
-            WHERE id = ?
-            """,
-            (data.quantity, item_id),
-        )
-        conn.commit()
-
-        summary = get_table_summary(conn, int(item["table_number"]))
-        item_total = data.quantity * int(item["unit_price"])
-
-    finally:
-        conn.close()
+    item, summary, item_total = await asyncio.to_thread(
+        update_quantity_in_firebase,
+        item_id,
+        data.quantity,
+    )
 
     await manager.broadcast(
         {
@@ -1019,6 +1084,85 @@ async def update_quantity(item_id: int, data: QuantityUpdate):
 # quantity = 0 => DELETE món.
 # =========================================================
 
+def update_table_items_in_firebase(table_number: int, edits: list[OrderItemEdit]):
+    item_ids = [edit.id for edit in edits]
+
+    if len(item_ids) != len(set(item_ids)):
+        raise HTTPException(status_code=400, detail="Danh sách có ID món bị trùng.")
+
+    row_map = {}
+
+    for item_id in item_ids:
+        item = get_item(item_id)
+
+        if item is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy món có id {item_id}.",
+            )
+
+        if int(item["table_number"]) != table_number:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Món {item['food_name']} không thuộc Bàn {table_number}.",
+            )
+
+        row_map[item_id] = item
+
+    firebase_updates = {}
+    changes = []
+    updated_items = 0
+    deleted_items = 0
+
+    for edit in edits:
+        item = row_map[edit.id]
+
+        before = {
+            "quantity": int(item["quantity"]),
+            "note": item["note"] or "",
+        }
+
+        after = {
+            "quantity": int(edit.quantity),
+            "note": edit.note,
+        }
+
+        if edit.quantity == 0:
+            firebase_updates[str(edit.id)] = None
+            action = "deleted"
+            deleted_items += 1
+        else:
+            firebase_updates[f"{edit.id}/quantity"] = int(edit.quantity)
+            firebase_updates[f"{edit.id}/note"] = edit.note
+            action = "updated"
+            updated_items += 1
+
+        changes.append(
+            {
+                "id": edit.id,
+                "food_name": item["food_name"],
+                "action": action,
+                "before": before,
+                "after": after,
+            }
+        )
+
+    order_items_ref().update(firebase_updates)
+
+    remaining_items = get_items_by_table(table_number)
+    total = sum(item["item_total"] for item in remaining_items)
+    summary = get_table_summary(table_number)
+
+    return {
+        "changes": changes,
+        "updated_items": updated_items,
+        "deleted_items": deleted_items,
+        "remaining_items": remaining_items,
+        "total": total,
+        "summary": summary,
+    }
+
+
 @app.patch("/orders/table/{table_number}/items")
 async def update_table_items(table_number: int, data: TableItemsUpdate):
     if table_number <= 0 or table_number > TOTAL_TABLES:
@@ -1027,134 +1171,30 @@ async def update_table_items(table_number: int, data: TableItemsUpdate):
     if len(data.items) == 0:
         raise HTTPException(status_code=400, detail="Không có thay đổi để cập nhật.")
 
-    item_ids = [item.id for item in data.items]
-    if len(item_ids) != len(set(item_ids)):
-        raise HTTPException(status_code=400, detail="Danh sách có ID món bị trùng.")
-
-    conn = get_connection()
-
-    try:
-        placeholders = ",".join("?" for _ in item_ids)
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE id IN ({placeholders})
-            """,
-            item_ids,
-        ).fetchall()
-
-        row_map = {int(row["id"]): row for row in rows}
-
-        for edit in data.items:
-            row = row_map.get(edit.id)
-
-            if row is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Không tìm thấy món có id {edit.id}.",
-                )
-
-            if int(row["table_number"]) != table_number:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Món {row['food_name']} không thuộc Bàn {table_number}.",
-                )
-
-        changes = []
-        updated_items = 0
-        deleted_items = 0
-
-        for edit in data.items:
-            row = row_map[edit.id]
-
-            before = {
-                "quantity": int(row["quantity"]),
-                "note": row["note"] or "",
-            }
-
-            after = {
-                "quantity": int(edit.quantity),
-                "note": edit.note,
-            }
-
-            if edit.quantity == 0:
-                conn.execute(
-                    """
-                    DELETE FROM order_items
-                    WHERE id = ? AND table_number = ?
-                    """,
-                    (edit.id, table_number),
-                )
-                action = "deleted"
-                deleted_items += 1
-            else:
-                conn.execute(
-                    """
-                    UPDATE order_items
-                    SET
-                        quantity = ?,
-                        note = ?
-                    WHERE id = ? AND table_number = ?
-                    """,
-                    (edit.quantity, edit.note, edit.id, table_number),
-                )
-                action = "updated"
-                updated_items += 1
-
-            changes.append(
-                {
-                    "id": edit.id,
-                    "food_name": row["food_name"],
-                    "action": action,
-                    "before": before,
-                    "after": after,
-                }
-            )
-
-        conn.commit()
-
-        remaining_rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE table_number = ?
-            ORDER BY id ASC
-            """,
-            (table_number,),
-        ).fetchall()
-
-        remaining_items = [row_to_dict(row) for row in remaining_rows]
-        total = sum(item["item_total"] for item in remaining_items)
-        summary = get_table_summary(conn, table_number)
-
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    result = await asyncio.to_thread(
+        update_table_items_in_firebase,
+        table_number,
+        data.items,
+    )
 
     await manager.broadcast(
         {
             "type": "table_items_updated",
             "table": table_number,
             "reason": "manager_update",
-            "changes": changes,
-            **summary,
+            "changes": result["changes"],
+            **result["summary"],
         }
     )
 
     return {
         "message": "Cập nhật đơn hàng thành công",
         "table_number": table_number,
-        "updated_items": updated_items,
-        "deleted_items": deleted_items,
-        "changes": changes,
-        "items": remaining_items,
-        "total": total,
+        "updated_items": result["updated_items"],
+        "deleted_items": result["deleted_items"],
+        "changes": result["changes"],
+        "items": result["remaining_items"],
+        "total": result["total"],
     }
 
 
@@ -1162,6 +1202,53 @@ async def update_table_items(table_number: int, data: TableItemsUpdate):
 # PATCH /order-items/{item_id}/robot-dispatch
 # Web -> FastAPI -> HiveMQ -> Robot tương ứng
 # =========================================================
+
+def prepare_robot_dispatch(item_id: int, robot_number: int, command_id: str):
+    item = get_item(item_id)
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+
+    if bool(item["delivered"]):
+        raise HTTPException(status_code=409, detail="Món này đã được giao.")
+
+    if int(item["cooking_status"] or 0) < 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Món chưa bắt đầu nấu. Hãy chờ đủ 5 giây trước khi chuyển robot.",
+        )
+
+    item_ref(item_id).update(
+        {
+            "assigned_robot": robot_number,
+            "robot_dispatched": True,
+            "delivery_status": "dispatched",
+            "dispatch_command_id": command_id,
+        }
+    )
+
+    return item
+
+
+def mark_robot_dispatch_failed(item_id: int, command_id: str):
+    current = get_item(item_id)
+
+    if current is None:
+        return
+
+    if current["delivered"]:
+        return
+
+    if str(current.get("dispatch_command_id") or "") != str(command_id):
+        return
+
+    item_ref(item_id).update(
+        {
+            "robot_dispatched": False,
+            "delivery_status": "failed",
+        }
+    )
+
 
 @app.patch("/order-items/{item_id}/robot-dispatch")
 async def dispatch_order_to_robot(item_id: int, data: RobotDispatchUpdate):
@@ -1173,86 +1260,41 @@ async def dispatch_order_to_robot(item_id: int, data: RobotDispatchUpdate):
     for change in cooking_changes:
         await manager.broadcast(change)
 
-    conn = get_connection()
     command_id = uuid.uuid4().hex[:8].upper()
 
+    item = await asyncio.to_thread(
+        prepare_robot_dispatch,
+        item_id,
+        data.robot,
+        command_id,
+    )
+
+    table_number = int(item["table_number"])
+    food_name = item["food_name"]
+    topic = mqtt_topic_for_robot(data.robot)
+
+    payload = {
+        "command_id": command_id,
+        "robot": data.robot,
+        "item_id": item_id,
+        "table": table_number,
+        "food_name": food_name,
+        "action": "deliver",
+    }
+
     try:
-        item = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE id = ?
-            """,
-            (item_id,),
-        ).fetchone()
-
-        if item is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy món.")
-
-        if bool(item["delivered"]):
-            raise HTTPException(status_code=409, detail="Món này đã được giao.")
-
-        if int(item["cooking_status"] or 0) < 1:
-            raise HTTPException(
-                status_code=409,
-                detail="Món chưa bắt đầu nấu. Hãy chờ đủ 5 giây trước khi chuyển robot.",
-            )
-
-        table_number = int(item["table_number"])
-        food_name = item["food_name"]
-        topic = mqtt_topic_for_robot(data.robot)
-
-        payload = {
-            "command_id": command_id,
-            "robot": data.robot,
-            "item_id": item_id,
-            "table": table_number,
-            "food_name": food_name,
-            "action": "deliver",
-        }
-
-        # Ghi command vào DB trước để ACK từ robot có thể được xác thực ngay.
-        conn.execute(
-            """
-            UPDATE order_items
-            SET
-                assigned_robot = ?,
-                robot_dispatched = 1,
-                delivery_status = 'dispatched',
-                dispatch_command_id = ?
-            WHERE id = ?
-            """,
-            (data.robot, command_id, item_id),
+        await asyncio.to_thread(
+            publish_robot_command,
+            topic,
+            payload,
         )
-        conn.commit()
-
-        try:
-            publish_robot_command(topic, payload)
-        except HTTPException:
-            # Nếu publish thất bại, đánh dấu failed để người dùng có thể gửi lại.
-            conn.execute(
-                """
-                UPDATE order_items
-                SET
-                    robot_dispatched = 0,
-                    delivery_status = 'failed'
-                WHERE id = ?
-                  AND delivered = 0
-                  AND dispatch_command_id = ?
-                """,
-                (item_id, command_id),
-            )
-            conn.commit()
-            raise
-
     except HTTPException:
-        conn.rollback()
+        await asyncio.to_thread(
+            mark_robot_dispatch_failed,
+            item_id,
+            command_id,
+        )
         raise
-    except Exception as error:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(error)) from error
-    finally:
-        conn.close()
 
     event = {
         "type": "robot_dispatched",
@@ -1280,68 +1322,59 @@ async def dispatch_order_to_robot(item_id: int, data: RobotDispatchUpdate):
 # Chỉ cho xóa khi tất cả món đã nấu xong và đã giao.
 # =========================================================
 
+def checkout_table_in_firebase(table_number: int):
+    items = get_items_by_table(table_number)
+
+    if len(items) == 0:
+        raise HTTPException(status_code=404, detail="Bàn này không có món để thanh toán.")
+
+    not_cooked = [item for item in items if int(item["cooking_status"]) < 2]
+    not_delivered = [item for item in items if not item["delivered"]]
+
+    if not_cooked or not_delivered:
+        details = []
+
+        if not_cooked:
+            details.append(
+                "Chưa nấu xong: "
+                + ", ".join(item["food_name"] for item in not_cooked)
+            )
+
+        if not_delivered:
+            details.append(
+                "Chưa giao: "
+                + ", ".join(item["food_name"] for item in not_delivered)
+            )
+
+        raise HTTPException(status_code=409, detail=" | ".join(details))
+
+    total = sum(item["item_total"] for item in items)
+    order_codes = sorted({item["order_code"] for item in items})
+    deleted_items = len(items)
+
+    delete_updates = {
+        str(item["id"]): None
+        for item in items
+    }
+
+    order_items_ref().update(delete_updates)
+
+    return {
+        "total": total,
+        "order_codes": order_codes,
+        "deleted_items": deleted_items,
+    }
+
+
 @app.delete("/orders/table/{table_number}")
 async def checkout_and_delete_table(table_number: int):
     if table_number <= 0 or table_number > TOTAL_TABLES:
         raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
-    conn = get_connection()
-
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT {ORDER_COLUMNS}
-            FROM order_items
-            WHERE table_number = ?
-            ORDER BY id ASC
-            """,
-            (table_number,),
-        ).fetchall()
-
-        if len(rows) == 0:
-            raise HTTPException(status_code=404, detail="Bàn này không có món để thanh toán.")
-
-        items = [row_to_dict(row) for row in rows]
-
-        not_cooked = [item for item in items if int(item["cooking_status"]) < 2]
-        not_delivered = [item for item in items if not item["delivered"]]
-
-        if not_cooked or not_delivered:
-            details = []
-
-            if not_cooked:
-                details.append(
-                    "Chưa nấu xong: " + ", ".join(item["food_name"] for item in not_cooked)
-                )
-
-            if not_delivered:
-                details.append(
-                    "Chưa giao: " + ", ".join(item["food_name"] for item in not_delivered)
-                )
-
-            raise HTTPException(status_code=409, detail=" | ".join(details))
-
-        total = sum(item["item_total"] for item in items)
-        order_codes = sorted({item["order_code"] for item in items})
-        deleted_items = len(items)
-
-        conn.execute(
-            """
-            DELETE FROM order_items
-            WHERE table_number = ?
-            """,
-            (table_number,),
-        )
-        conn.commit()
-
-    except HTTPException:
-        conn.rollback()
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    result = await asyncio.to_thread(
+        checkout_table_in_firebase,
+        table_number,
+    )
 
     await manager.broadcast(
         {
@@ -1355,7 +1388,7 @@ async def checkout_and_delete_table(table_number: int):
     return {
         "message": "Thanh toán thành công và đã xóa đơn của bàn",
         "table_number": table_number,
-        "total": total,
-        "deleted_items": deleted_items,
-        "deleted_order_codes": order_codes,
+        "total": result["total"],
+        "deleted_items": result["deleted_items"],
+        "deleted_order_codes": result["order_codes"],
     }
