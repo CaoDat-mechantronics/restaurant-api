@@ -171,6 +171,52 @@ def init_firebase():
 
     return app_instance
 
+def normalize_firebase_collection(data) -> dict:
+    """
+    Firebase Realtime Database có thể trả collection:
+    - dict nếu key không liên tục
+    - list nếu key là số liên tục: 1, 2, 3, ...
+
+    Hàm này chuẩn hóa cả hai thành:
+    {
+        "1": {...},
+        "2": {...}
+    }
+    """
+
+    if data is None:
+        return {}
+
+    # =========================================
+    # FIREBASE TRẢ DICT
+    # =========================================
+
+    if isinstance(data, dict):
+        return {
+            str(key): value
+            for key, value in data.items()
+            if isinstance(value, dict)
+        }
+
+    # =========================================
+    # FIREBASE TRẢ LIST
+    # =========================================
+
+    if isinstance(data, list):
+
+        result = {}
+
+        for index, value in enumerate(data):
+
+            if not isinstance(value, dict):
+                continue
+
+            result[str(index)] = value
+
+        return result
+
+    return {}
+
 
 def firebase_path(child_path: str = "") -> str:
     child_path = str(child_path or "").strip().strip("/")
@@ -239,13 +285,23 @@ def firebase_item_to_dict(item_id, data):
     }
 
 
+
+
 def get_all_items_raw() -> dict:
+
     data = order_items_ref().get()
 
-    if not isinstance(data, dict):
-        return {}
+    normalized = normalize_firebase_collection(
+        data
+    )
 
-    return data
+    print(
+        f"[FIREBASE] get_all_items_raw: "
+        f"type={type(data).__name__}, "
+        f"items={len(normalized)}"
+    )
+
+    return normalized
 
 
 def get_all_items() -> list[dict]:
@@ -270,45 +326,78 @@ def get_item(item_id: int):
     return firebase_item_to_dict(item_id, data)
 
 
-def get_items_by_table(table_number: int) -> list[dict]:
+def get_items_by_table(
+    table_number: int
+) -> list[dict]:
+
     snapshot = (
         order_items_ref()
-        .order_by_child("table_number")
-        .equal_to(int(table_number))
+        .order_by_child(
+            "table_number"
+        )
+        .equal_to(
+            int(table_number)
+        )
         .get()
     )
 
-    if not isinstance(snapshot, dict):
-        return []
+    snapshot = (
+        normalize_firebase_collection(
+            snapshot
+        )
+    )
 
     items = [
-        firebase_item_to_dict(item_id, item_data)
-        for item_id, item_data in snapshot.items()
-        if isinstance(item_data, dict)
+        firebase_item_to_dict(
+            item_id,
+            item_data
+        )
+        for item_id, item_data
+        in snapshot.items()
     ]
 
-    items.sort(key=lambda item: item["id"])
+    items.sort(
+        key=lambda item:
+            item["id"]
+    )
+
     return items
 
+def get_items_by_order_code(
+    order_code: str
+) -> list[dict]:
 
-def get_items_by_order_code(order_code: str) -> list[dict]:
     snapshot = (
         order_items_ref()
-        .order_by_child("order_code")
-        .equal_to(str(order_code))
+        .order_by_child(
+            "order_code"
+        )
+        .equal_to(
+            str(order_code)
+        )
         .get()
     )
 
-    if not isinstance(snapshot, dict):
-        return []
+    snapshot = (
+        normalize_firebase_collection(
+            snapshot
+        )
+    )
 
     items = [
-        firebase_item_to_dict(item_id, item_data)
-        for item_id, item_data in snapshot.items()
-        if isinstance(item_data, dict)
+        firebase_item_to_dict(
+            item_id,
+            item_data
+        )
+        for item_id, item_data
+        in snapshot.items()
     ]
 
-    items.sort(key=lambda item: item["id"])
+    items.sort(
+        key=lambda item:
+            item["id"]
+    )
+
     return items
 
 
@@ -602,28 +691,56 @@ def parse_created_at(value: str):
 
 
 def update_cooking_statuses_once():
+    """
+    cooking_status:
 
-    raw_items = get_all_items_raw()
+    0 = chưa nấu
+    1 = đang nấu
+    2 = đã nấu xong
+
+    Sau 5 giây:
+        0 -> 1
+
+    Sau 10 giây:
+        0/1 -> 2
+    """
+
+    raw_items = (
+        get_all_items_raw()
+    )
 
     now = datetime.now(
         timezone.utc
     )
 
     changes = []
-    updates = {}
+
+    firebase_updates = []
 
     print(
-        f"[COOKING] Scan {len(raw_items)} items "
+        f"[COOKING] Scan "
+        f"{len(raw_items)} items "
         f"at {now.isoformat()}"
     )
 
-    for item_key, data in raw_items.items():
+    # =========================================
+    # DUYỆT MÓN
+    # =========================================
+
+    for (
+        item_key,
+        data
+    ) in raw_items.items():
 
         if not isinstance(
             data,
             dict
         ):
             continue
+
+        # =====================================
+        # ID + STATUS
+        # =====================================
 
         try:
 
@@ -638,23 +755,44 @@ def update_cooking_statuses_once():
                     "cooking_status",
                     0
                 )
+                or
+                0
             )
 
         except (
             TypeError,
             ValueError
         ):
+
+            print(
+                "[COOKING] ID/status "
+                "không hợp lệ:",
+                item_key
+            )
+
             continue
+
+        # =====================================
+        # ĐÃ NẤU XONG
+        # =====================================
 
         if old_status >= 2:
             continue
 
-        created_at_raw = data.get(
-            "created_at"
+        # =====================================
+        # CREATED_AT
+        # =====================================
+
+        created_at_raw = (
+            data.get(
+                "created_at"
+            )
         )
 
-        created_at = parse_created_at(
-            created_at_raw
+        created_at = (
+            parse_created_at(
+                created_at_raw
+            )
         )
 
         if created_at is None:
@@ -667,26 +805,33 @@ def update_cooking_statuses_once():
 
             continue
 
+        # =====================================
+        # AGE
+        # =====================================
+
         age_seconds = (
             now - created_at
         ).total_seconds()
 
+        if age_seconds < 0:
+
+            print(
+                f"[COOKING] item={item_id}: "
+                "created_at ở tương lai"
+            )
+
+            age_seconds = 0
+
         print(
-            f"[COOKING] item={item_id}, "
+            f"[COOKING] "
+            f"item={item_id}, "
             f"age={age_seconds:.1f}s, "
             f"status={old_status}"
         )
 
-        # Nếu thời gian hơi lệch âm
-        if age_seconds < 0:
-
-            print(
-                f"[COOKING] WARNING: "
-                f"item={item_id} có created_at "
-                f"nằm trong tương lai."
-            )
-
-            age_seconds = 0
+        # =====================================
+        # STATUS MỚI
+        # =====================================
 
         if age_seconds >= 10:
 
@@ -700,12 +845,23 @@ def update_cooking_statuses_once():
 
             new_status = 0
 
-        if new_status == old_status:
+        # Không đổi
+        if (
+            new_status ==
+            old_status
+        ):
             continue
 
-        updates[
-            f"{item_key}/cooking_status"
-        ] = new_status
+        # =====================================
+        # LƯU UPDATE
+        # =====================================
+
+        firebase_updates.append(
+            (
+                str(item_key),
+                new_status
+            )
+        )
 
         changes.append(
             {
@@ -721,6 +877,8 @@ def update_cooking_statuses_once():
                             "table_number",
                             0
                         )
+                        or
+                        0
                     ),
 
                 "food_name":
@@ -737,21 +895,29 @@ def update_cooking_statuses_once():
         )
 
         print(
-            f"[COOKING] UPDATE "
+            f"[COOKING] "
             f"item={item_id}: "
-            f"{old_status} -> {new_status}"
+            f"{old_status} -> "
+            f"{new_status}"
         )
 
-    if updates:
+    # =========================================
+    # GHI FIREBASE
+    # =========================================
 
-        print(
-            "[COOKING] Firebase update:",
-            updates
-        )
+    for (
+        item_key,
+        new_status
+    ) in firebase_updates:
 
-        order_items_ref().update(
-            updates
-        )
+        order_items_ref() \
+            .child(item_key) \
+            .update(
+                {
+                    "cooking_status":
+                        new_status
+                }
+            )
 
     return changes
 
