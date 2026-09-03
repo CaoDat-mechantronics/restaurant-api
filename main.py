@@ -602,80 +602,194 @@ def parse_created_at(value: str):
 
 
 def update_cooking_statuses_once():
-    """
-    0 - dưới 5 giây: chưa nấu
-    1 - từ 5 đến dưới 10 giây: đang nấu
-    2 - từ 10 giây trở lên: đã nấu
 
-    Trả về các item vừa đổi trạng thái để push WebSocket.
-    """
     raw_items = get_all_items_raw()
-    now = datetime.now(timezone.utc)
+
+    now = datetime.now(
+        timezone.utc
+    )
 
     changes = []
     updates = {}
 
+    print(
+        f"[COOKING] Scan {len(raw_items)} items "
+        f"at {now.isoformat()}"
+    )
+
     for item_key, data in raw_items.items():
-        if not isinstance(data, dict):
+
+        if not isinstance(
+            data,
+            dict
+        ):
             continue
 
         try:
-            item_id = int(data.get("id") or item_key)
-            old_status = int(data.get("cooking_status") or 0)
-        except (TypeError, ValueError):
+
+            item_id = int(
+                data.get("id")
+                or
+                item_key
+            )
+
+            old_status = int(
+                data.get(
+                    "cooking_status",
+                    0
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
             continue
 
         if old_status >= 2:
             continue
 
-        created_at = parse_created_at(data.get("created_at"))
+        created_at_raw = data.get(
+            "created_at"
+        )
+
+        created_at = parse_created_at(
+            created_at_raw
+        )
 
         if created_at is None:
+
+            print(
+                f"[COOKING] item={item_id}: "
+                f"created_at không hợp lệ: "
+                f"{created_at_raw}"
+            )
+
             continue
 
-        age_seconds = max(0.0, (now - created_at).total_seconds())
+        age_seconds = (
+            now - created_at
+        ).total_seconds()
+
+        print(
+            f"[COOKING] item={item_id}, "
+            f"age={age_seconds:.1f}s, "
+            f"status={old_status}"
+        )
+
+        # Nếu thời gian hơi lệch âm
+        if age_seconds < 0:
+
+            print(
+                f"[COOKING] WARNING: "
+                f"item={item_id} có created_at "
+                f"nằm trong tương lai."
+            )
+
+            age_seconds = 0
 
         if age_seconds >= 10:
+
             new_status = 2
+
         elif age_seconds >= 5:
+
             new_status = 1
+
         else:
+
             new_status = 0
 
         if new_status == old_status:
             continue
 
-        # Nested multi-location update: {"25/cooking_status": 1, ...}
-        updates[f"{item_key}/cooking_status"] = new_status
+        updates[
+            f"{item_key}/cooking_status"
+        ] = new_status
 
         changes.append(
             {
-                "type": "item_cooking_status",
-                "item_id": item_id,
-                "table": int(data.get("table_number") or 0),
-                "food_name": str(data.get("food_name") or ""),
-                "cooking_status": new_status,
+                "type":
+                    "item_cooking_status",
+
+                "item_id":
+                    item_id,
+
+                "table":
+                    int(
+                        data.get(
+                            "table_number",
+                            0
+                        )
+                    ),
+
+                "food_name":
+                    str(
+                        data.get(
+                            "food_name",
+                            ""
+                        )
+                    ),
+
+                "cooking_status":
+                    new_status,
             }
         )
 
+        print(
+            f"[COOKING] UPDATE "
+            f"item={item_id}: "
+            f"{old_status} -> {new_status}"
+        )
+
     if updates:
-        order_items_ref().update(updates)
+
+        print(
+            "[COOKING] Firebase update:",
+            updates
+        )
+
+        order_items_ref().update(
+            updates
+        )
 
     return changes
 
 
 async def cooking_status_worker():
+
+    print(
+        "[COOKING] Worker started"
+    )
+
     while True:
+
         try:
-            changes = await asyncio.to_thread(update_cooking_statuses_once)
+
+            changes = await asyncio.to_thread(
+                update_cooking_statuses_once
+            )
 
             for change in changes:
-                await manager.broadcast(change)
+
+                await manager.broadcast(
+                    change
+                )
 
         except asyncio.CancelledError:
+
+            print(
+                "[COOKING] Worker stopped"
+            )
+
             raise
+
         except Exception as error:
-            print(f"[COOKING] Worker error: {error}")
+
+            print(
+                "[COOKING] Worker error:",
+                repr(error)
+            )
 
         await asyncio.sleep(1)
 
@@ -928,17 +1042,72 @@ def get_table_statuses():
 # GET /orders/table/{table_number}
 # =========================================================
 
-@app.get("/orders/table/{table_number}")
-def get_orders_by_table(table_number: int):
-    if table_number <= 0 or table_number > TOTAL_TABLES:
-        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+@app.get(
+    "/orders/table/{table_number}"
+)
+async def get_orders_by_table(
+    table_number: int
+):
 
-    items = get_items_by_table(table_number)
+    if (
+        table_number <= 0
+        or
+        table_number > TOTAL_TABLES
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="Số bàn không hợp lệ."
+        )
+
+    # =========================================
+    # FALLBACK:
+    # mỗi lần frontend đọc dữ liệu
+    # thì kiểm tra trạng thái nấu luôn
+    # =========================================
+
+    try:
+
+        cooking_changes = (
+            await asyncio.to_thread(
+                update_cooking_statuses_once
+            )
+        )
+
+        for change in cooking_changes:
+
+            await manager.broadcast(
+                change
+            )
+
+    except Exception as error:
+
+        print(
+            "[COOKING] GET fallback error:",
+            repr(error)
+        )
+
+    # =========================================
+    # ĐỌC DỮ LIỆU
+    # =========================================
+
+    items = await asyncio.to_thread(
+        get_items_by_table,
+        table_number
+    )
 
     return {
-        "table_number": table_number,
-        "items": items,
-        "total": sum(item["item_total"] for item in items),
+        "table_number":
+            table_number,
+
+        "items":
+            items,
+
+        "total":
+            sum(
+                item["item_total"]
+                for item in items
+            ),
     }
 
 
@@ -1392,3 +1561,46 @@ async def checkout_and_delete_table(table_number: int):
         "deleted_items": result["deleted_items"],
         "deleted_order_codes": result["order_codes"],
     }
+
+## Debug API
+@app.get("/debug/cooking")
+async def debug_cooking():
+
+    try:
+
+        changes = (
+            await asyncio.to_thread(
+                update_cooking_statuses_once
+            )
+        )
+
+        for change in changes:
+
+            await manager.broadcast(
+                change
+            )
+
+        items = await asyncio.to_thread(
+            get_all_items
+        )
+
+        return {
+            "success":
+                True,
+
+            "changes":
+                changes,
+
+            "items":
+                items,
+        }
+
+    except Exception as error:
+
+        return {
+            "success":
+                False,
+
+            "error":
+                repr(error),
+        }
