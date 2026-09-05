@@ -818,6 +818,8 @@ def reserve_item_ids(count: int) -> list[int]:
 # =========================================================
 
 class ConnectionManager:
+    """WebSocket dành cho dashboard quản lý đã xác thực JWT."""
+
     def __init__(self):
         self.connections: list[WebSocket] = []
 
@@ -842,9 +844,62 @@ class ConnectionManager:
             self.disconnect(websocket)
 
 
+class MenuConnectionManager:
+    """
+    WebSocket public cho trang menu.
+
+    Mỗi client chỉ đăng ký đúng một số bàn nên sự kiện của Bàn 1
+    không bị gửi sang menu Bàn 2, Bàn 3, ...
+    """
+
+    def __init__(self):
+        self.connections: dict[int, list[WebSocket]] = {}
+
+    async def connect(self, table_number: int, websocket: WebSocket):
+        await websocket.accept()
+        self.connections.setdefault(int(table_number), []).append(websocket)
+
+    def disconnect(self, table_number: int, websocket: WebSocket):
+        table_number = int(table_number)
+        sockets = self.connections.get(table_number, [])
+
+        if websocket in sockets:
+            sockets.remove(websocket)
+
+        if not sockets:
+            self.connections.pop(table_number, None)
+
+    async def broadcast(self, data: dict):
+        try:
+            table_number = int(data.get("table") or 0)
+        except (TypeError, ValueError):
+            return
+
+        if table_number <= 0:
+            return
+
+        dead_connections = []
+
+        for websocket in list(self.connections.get(table_number, [])):
+            try:
+                await websocket.send_json(data)
+            except Exception:
+                dead_connections.append(websocket)
+
+        for websocket in dead_connections:
+            self.disconnect(table_number, websocket)
+
+
 manager = ConnectionManager()
+menu_manager = MenuConnectionManager()
 fastapi_loop = None
 cooking_task = None
+
+
+async def broadcast_event(data: dict):
+    """Gửi realtime cho cả dashboard và menu của đúng bàn."""
+    await manager.broadcast(data)
+    await menu_manager.broadcast(data)
 
 
 def broadcast_from_mqtt_thread(data: dict):
@@ -855,7 +910,7 @@ def broadcast_from_mqtt_thread(data: dict):
         return
 
     asyncio.run_coroutine_threadsafe(
-        manager.broadcast(data),
+        broadcast_event(data),
         fastapi_loop,
     )
 
@@ -1287,7 +1342,7 @@ async def cooking_status_worker():
 
             for change in changes:
 
-                await manager.broadcast(
+                await broadcast_event(
                     change
                 )
 
@@ -1649,6 +1704,39 @@ async def dashboard_websocket(websocket: WebSocket):
 
 
 # =========================================================
+# WEBSOCKET MENU PUBLIC THEO TỪNG BÀN
+# Không yêu cầu JWT. Chỉ nhận event của đúng table_number.
+# =========================================================
+
+@app.websocket("/ws/menu/{table_number}")
+async def menu_websocket(websocket: WebSocket, table_number: int):
+    if table_number <= 0 or table_number > TOTAL_TABLES:
+        await websocket.close(code=1008, reason="Invalid table number")
+        return
+
+    await menu_manager.connect(table_number, websocket)
+
+    try:
+        await websocket.send_json(
+            {
+                "type": "menu_ready",
+                "table": table_number,
+            }
+        )
+
+        # Client menu không cần gửi token hay heartbeat riêng.
+        # receive_text() chỉ giữ socket sống và phát hiện disconnect.
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        menu_manager.disconnect(table_number, websocket)
+    except Exception as error:
+        print(f"[WS] menu table={table_number} error:", repr(error))
+        menu_manager.disconnect(table_number, websocket)
+
+
+# =========================================================
 # POST /orders - ĐẶT MÓN
 # =========================================================
 
@@ -1715,7 +1803,7 @@ async def create_order(order: OrderCreate):
             detail=f"Không thể ghi đơn hàng vào Firebase: {error}",
         ) from error
 
-    await manager.broadcast(
+    await broadcast_event(
         {
             "type": "order_created",
             "table": order.tableNumber,
@@ -1781,77 +1869,53 @@ def get_table_statuses(current_user: dict = Depends(get_current_user)):
 
 
 # =========================================================
-# GET /orders/table/{table_number}
+# ĐỌC ĐƠN CỦA MỘT BÀN - DÙNG CHUNG CHO MENU + DASHBOARD
 # =========================================================
 
-@app.get(
-    "/orders/table/{table_number}"
-)
+async def build_table_order_payload(table_number: int):
+    if table_number <= 0 or table_number > TOTAL_TABLES:
+        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+
+    # Fallback: mỗi lần frontend đọc dữ liệu thì cập nhật trạng thái nấu.
+    try:
+        cooking_changes = await asyncio.to_thread(update_cooking_statuses_once)
+
+        for change in cooking_changes:
+            await broadcast_event(change)
+
+    except Exception as error:
+        print("[COOKING] GET fallback error:", repr(error))
+
+    items = await asyncio.to_thread(get_items_by_table, table_number)
+
+    return {
+        "table_number": table_number,
+        "items": items,
+        "total": sum(item["item_total"] for item in items),
+    }
+
+
+# =========================================================
+# MENU PUBLIC - XEM MÓN ĐÃ ĐẶT CỦA ĐÚNG BÀN
+# Không yêu cầu JWT.
+# =========================================================
+
+@app.get("/menu/orders/table/{table_number}")
+async def menu_get_orders_by_table(table_number: int):
+    return await build_table_order_payload(table_number)
+
+
+# =========================================================
+# DASHBOARD - XEM MÓN CỦA BÀN
+# Bắt buộc JWT manager/admin.
+# =========================================================
+
+@app.get("/orders/table/{table_number}")
 async def get_orders_by_table(
     table_number: int,
     current_user: dict = Depends(get_current_user),
 ):
-
-    if (
-        table_number <= 0
-        or
-        table_number > TOTAL_TABLES
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Số bàn không hợp lệ."
-        )
-
-    # =========================================
-    # FALLBACK:
-    # mỗi lần frontend đọc dữ liệu
-    # thì kiểm tra trạng thái nấu luôn
-    # =========================================
-
-    try:
-
-        cooking_changes = (
-            await asyncio.to_thread(
-                update_cooking_statuses_once
-            )
-        )
-
-        for change in cooking_changes:
-
-            await manager.broadcast(
-                change
-            )
-
-    except Exception as error:
-
-        print(
-            "[COOKING] GET fallback error:",
-            repr(error)
-        )
-
-    # =========================================
-    # ĐỌC DỮ LIỆU
-    # =========================================
-
-    items = await asyncio.to_thread(
-        get_items_by_table,
-        table_number
-    )
-
-    return {
-        "table_number":
-            table_number,
-
-        "items":
-            items,
-
-        "total":
-            sum(
-                item["item_total"]
-                for item in items
-            ),
-    }
+    return await build_table_order_payload(table_number)
 
 
 # =========================================================
@@ -1933,7 +1997,7 @@ async def update_delivery_status(
         data.delivered,
     )
 
-    await manager.broadcast(
+    await broadcast_event(
         {
             "type": "item_delivery_changed",
             "item_id": item_id,
@@ -1983,11 +2047,84 @@ async def update_quantity(
         data.quantity,
     )
 
-    await manager.broadcast(
+    await broadcast_event(
         {
             "type": "table_items_updated",
             "table": int(item["table_number"]),
             "reason": "quantity_updated",
+            "item_id": item_id,
+            **summary,
+        }
+    )
+
+    return {
+        "message": "Cập nhật số lượng thành công",
+        "id": item_id,
+        "quantity": data.quantity,
+        "item_total": item_total,
+    }
+
+
+# =========================================================
+# MENU PUBLIC - QUY TẮC SỬA MÓN
+# Chỉ được sửa/xóa khi món vẫn đang chờ nấu.
+# =========================================================
+
+def ensure_menu_item_editable(item: dict, table_number: int):
+    if int(item.get("table_number") or 0) != int(table_number):
+        raise HTTPException(status_code=404, detail="Không tìm thấy món của bàn này.")
+
+    if bool(item.get("delivered")):
+        raise HTTPException(status_code=409, detail="Món đã giao nên không thể sửa.")
+
+    if bool(item.get("robot_dispatched")):
+        raise HTTPException(status_code=409, detail="Món đã chuyển cho robot nên không thể sửa.")
+
+    if int(item.get("cooking_status") or 0) != 0:
+        raise HTTPException(status_code=409, detail="Món đã bắt đầu nấu nên không thể sửa.")
+
+
+def update_menu_quantity_in_firebase(
+    table_number: int,
+    item_id: int,
+    quantity: int,
+):
+    item = get_item(item_id)
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+
+    ensure_menu_item_editable(item, table_number)
+
+    item_ref(item_id).update({"quantity": int(quantity)})
+
+    summary = get_table_summary(table_number)
+    item_total = int(quantity) * int(item["unit_price"])
+
+    return item, summary, item_total
+
+
+@app.patch("/menu/orders/table/{table_number}/items/{item_id}/quantity")
+async def menu_update_quantity(
+    table_number: int,
+    item_id: int,
+    data: QuantityUpdate,
+):
+    if table_number <= 0 or table_number > TOTAL_TABLES:
+        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+
+    item, summary, item_total = await asyncio.to_thread(
+        update_menu_quantity_in_firebase,
+        table_number,
+        item_id,
+        data.quantity,
+    )
+
+    await broadcast_event(
+        {
+            "type": "table_items_updated",
+            "table": table_number,
+            "reason": "menu_quantity_updated",
             "item_id": item_id,
             **summary,
         }
@@ -2104,7 +2241,7 @@ async def update_table_items(
         data.items,
     )
 
-    await manager.broadcast(
+    await broadcast_event(
         {
             "type": "table_items_updated",
             "table": table_number,
@@ -2116,6 +2253,76 @@ async def update_table_items(
 
     return {
         "message": "Cập nhật đơn hàng thành công",
+        "table_number": table_number,
+        "updated_items": result["updated_items"],
+        "deleted_items": result["deleted_items"],
+        "changes": result["changes"],
+        "items": result["remaining_items"],
+        "total": result["total"],
+    }
+
+
+# =========================================================
+# MENU PUBLIC - XÓA MÓN CHƯA BẮT ĐẦU NẤU
+# Endpoint này chỉ chấp nhận quantity = 0 (xóa), không dùng để sửa note.
+# =========================================================
+
+def delete_menu_table_items_in_firebase(
+    table_number: int,
+    edits: list[OrderItemEdit],
+):
+    item_ids = [edit.id for edit in edits]
+
+    if len(item_ids) != len(set(item_ids)):
+        raise HTTPException(status_code=400, detail="Danh sách có ID món bị trùng.")
+
+    for edit in edits:
+        if int(edit.quantity) != 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Menu chỉ được dùng endpoint này để xóa món (quantity = 0).",
+            )
+
+        item = get_item(edit.id)
+
+        if item is None:
+            raise HTTPException(status_code=404, detail=f"Không tìm thấy món có id {edit.id}.")
+
+        ensure_menu_item_editable(item, table_number)
+
+    # Sau khi kiểm tra quyền sửa trạng thái, dùng lại logic update/delete chuẩn.
+    return update_table_items_in_firebase(table_number, edits)
+
+
+@app.patch("/menu/orders/table/{table_number}/items")
+async def menu_delete_table_items(
+    table_number: int,
+    data: TableItemsUpdate,
+):
+    if table_number <= 0 or table_number > TOTAL_TABLES:
+        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+
+    if len(data.items) == 0:
+        raise HTTPException(status_code=400, detail="Không có món để xóa.")
+
+    result = await asyncio.to_thread(
+        delete_menu_table_items_in_firebase,
+        table_number,
+        data.items,
+    )
+
+    await broadcast_event(
+        {
+            "type": "table_items_updated",
+            "table": table_number,
+            "reason": "menu_item_deleted",
+            "changes": result["changes"],
+            **result["summary"],
+        }
+    )
+
+    return {
+        "message": "Đã xóa món khỏi đơn hàng",
         "table_number": table_number,
         "updated_items": result["updated_items"],
         "deleted_items": result["deleted_items"],
@@ -2189,7 +2396,7 @@ async def dispatch_order_to_robot(
     # Đảm bảo trạng thái nấu vừa được tính trước khi kiểm tra.
     cooking_changes = await asyncio.to_thread(update_cooking_statuses_once)
     for change in cooking_changes:
-        await manager.broadcast(change)
+        await broadcast_event(change)
 
     command_id = uuid.uuid4().hex[:8].upper()
 
@@ -2239,7 +2446,7 @@ async def dispatch_order_to_robot(
         "delivery_status": "dispatched",
     }
 
-    await manager.broadcast(event)
+    await broadcast_event(event)
 
     return {
         "message": "Đã gửi lệnh tới robot qua HiveMQ",
@@ -2310,7 +2517,7 @@ async def checkout_and_delete_table(
         table_number,
     )
 
-    await manager.broadcast(
+    await broadcast_event(
         {
             "type": "table_cleared",
             "table": table_number,
@@ -2341,7 +2548,7 @@ async def debug_cooking(admin_user: dict = Depends(require_admin)):
 
         for change in changes:
 
-            await manager.broadcast(
+            await broadcast_event(
                 change
             )
 
