@@ -1,18 +1,24 @@
 import asyncio
+import hashlib
 import json
 import os
+import re
 import ssl
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import firebase_admin
+import jwt
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from firebase_admin import credentials, db
+from jwt.exceptions import InvalidTokenError
+from pwdlib import PasswordHash
 from pydantic import BaseModel, Field
 
 
@@ -61,6 +67,15 @@ else:
         if origin.strip()
     ]
 
+# JWT / account management
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "").strip()
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "120")
+)
+INITIAL_ADMIN_USERNAME = os.getenv("INITIAL_ADMIN_USERNAME", "").strip()
+INITIAL_ADMIN_PASSWORD = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+
 
 # =========================================================
 # PYDANTIC MODELS
@@ -98,6 +113,28 @@ class OrderItemEdit(BaseModel):
 
 class TableItemsUpdate(BaseModel):
     items: list[OrderItemEdit]
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=200)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=8, max_length=200)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+class ManagerUserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=200)
+    active: bool = True
+
+
+class ManagerUserUpdate(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=50)
+    new_password: str | None = Field(default=None, min_length=8, max_length=200)
+    active: bool | None = None
 
 
 # =========================================================
@@ -247,6 +284,318 @@ def meta_ref():
 
 def item_ref(item_id: int):
     return db.reference(firebase_path(f"order_items/{int(item_id)}"))
+
+
+def users_ref():
+    return db.reference(firebase_path("users"))
+
+
+def username_indexes_ref():
+    return db.reference(firebase_path("username_indexes"))
+
+
+# =========================================================
+# AUTH / JWT / ROLE HELPERS
+# =========================================================
+
+password_hasher = PasswordHash.recommended()
+bearer_scheme = HTTPBearer(auto_error=False)
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{3,50}$")
+
+
+def validate_auth_configuration():
+    if len(JWT_SECRET_KEY) < 32:
+        raise RuntimeError(
+            "JWT_SECRET_KEY phải có ít nhất 32 ký tự. "
+            "Hãy đặt secret ngẫu nhiên trong .env / Render Environment."
+        )
+
+    if JWT_ACCESS_TOKEN_EXPIRE_MINUTES <= 0:
+        raise RuntimeError("JWT_ACCESS_TOKEN_EXPIRE_MINUTES phải > 0.")
+
+
+def normalize_username(username: str) -> str:
+    value = str(username or "").strip().lower()
+
+    if not USERNAME_PATTERN.fullmatch(value):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Username phải dài 3-50 ký tự và chỉ gồm chữ, số, "
+                "_ - hoặc dấu chấm."
+            ),
+        )
+
+    return value
+
+
+def username_index_key(username: str) -> str:
+    normalized = normalize_username(username)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": str(user.get("id") or ""),
+        "username": str(user.get("username") or ""),
+        "role": str(user.get("role") or "manager"),
+        "active": bool(user.get("active", True)),
+        "created_at": str(user.get("created_at") or ""),
+        "updated_at": str(user.get("updated_at") or ""),
+    }
+
+
+def get_user_by_id(user_id: str):
+    data = users_ref().child(str(user_id)).get()
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def get_user_by_username(username: str):
+    normalized = normalize_username(username)
+    index_key = username_index_key(normalized)
+    user_id = username_indexes_ref().child(index_key).get()
+
+    if not user_id:
+        return None
+
+    user = get_user_by_id(str(user_id))
+    if not user:
+        return None
+
+    if str(user.get("username_normalized") or "") != normalized:
+        return None
+
+    return user
+
+
+def create_user_record(username: str, password: str, role: str, active: bool = True):
+    normalized = normalize_username(username)
+
+    if role not in ("manager", "admin"):
+        raise HTTPException(status_code=400, detail="Role không hợp lệ.")
+
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Mật khẩu phải có ít nhất 8 ký tự.")
+
+    if get_user_by_username(normalized) is not None:
+        raise HTTPException(status_code=409, detail="Username đã tồn tại.")
+
+    user_id = uuid.uuid4().hex
+    index_key = username_index_key(normalized)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    record = {
+        "id": user_id,
+        "username": normalized,
+        "username_normalized": normalized,
+        "password_hash": password_hasher.hash(password),
+        "role": role,
+        "active": bool(active),
+        "token_version": 0,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    # Reserve username index first to reduce duplicate-user races.
+    index_ref = username_indexes_ref().child(index_key)
+
+    def reserve_index(current):
+        if current is not None:
+            raise ValueError("USERNAME_EXISTS")
+        return user_id
+
+    try:
+        index_ref.transaction(reserve_index)
+    except Exception as error:
+        if "USERNAME_EXISTS" in str(error):
+            raise HTTPException(status_code=409, detail="Username đã tồn tại.") from error
+        raise
+
+    try:
+        users_ref().child(user_id).set(record)
+    except Exception:
+        index_ref.delete()
+        raise
+
+    return record
+
+
+def ensure_initial_admin():
+    data = users_ref().get() or {}
+    existing_admin = False
+
+    if isinstance(data, dict):
+        existing_admin = any(
+            isinstance(user, dict)
+            and str(user.get("role") or "") == "admin"
+            for user in data.values()
+        )
+
+    if existing_admin:
+        return
+
+    if not INITIAL_ADMIN_USERNAME or not INITIAL_ADMIN_PASSWORD:
+        raise RuntimeError(
+            "Chưa có tài khoản admin. Hãy cấu hình INITIAL_ADMIN_USERNAME và "
+            "INITIAL_ADMIN_PASSWORD cho lần khởi tạo đầu tiên."
+        )
+
+    admin = create_user_record(
+        INITIAL_ADMIN_USERNAME,
+        INITIAL_ADMIN_PASSWORD,
+        role="admin",
+        active=True,
+    )
+    print(f"[AUTH] Initial admin created: {admin['username']}")
+
+
+def authenticate_user(username: str, password: str):
+    user = get_user_by_username(username)
+
+    if not user or not bool(user.get("active", True)):
+        return None
+
+    password_hash = str(user.get("password_hash") or "")
+
+    try:
+        valid = bool(password_hash) and password_hasher.verify(password, password_hash)
+    except Exception:
+        valid = False
+
+    return user if valid else None
+
+
+def create_access_token(user: dict):
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    payload = {
+        "sub": str(user["id"]),
+        "username": str(user["username"]),
+        "role": str(user["role"]),
+        "ver": int(user.get("token_version") or 0),
+        "iat": now,
+        "exp": expires_at,
+    }
+
+    token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return token, expires_at
+
+
+def verify_access_token(token: str):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Phiên đăng nhập không hợp lệ hoặc đã hết hạn.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+        )
+        user_id = str(payload.get("sub") or "")
+        token_version = int(payload.get("ver") or 0)
+    except (InvalidTokenError, TypeError, ValueError):
+        raise credentials_exception
+
+    if not user_id:
+        raise credentials_exception
+
+    user = get_user_by_id(user_id)
+
+    if not user or not bool(user.get("active", True)):
+        raise credentials_exception
+
+    if int(user.get("token_version") or 0) != token_version:
+        raise credentials_exception
+
+    if str(user.get("role") or "") not in ("manager", "admin"):
+        raise credentials_exception
+
+    return user
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Bạn chưa đăng nhập.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return verify_access_token(credentials.credentials)
+
+
+def require_admin(current_user: dict = Depends(get_current_user)):
+    if str(current_user.get("role") or "") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Chỉ tài khoản admin được phép thực hiện thao tác này.",
+        )
+    return current_user
+
+
+def bump_token_version(user_id: str):
+    ref = users_ref().child(str(user_id)).child("token_version")
+
+    def increment(current):
+        try:
+            value = int(current or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value + 1
+
+    return int(ref.transaction(increment))
+
+
+def change_username(user: dict, new_username: str):
+    old_normalized = str(user.get("username_normalized") or user.get("username") or "")
+    new_normalized = normalize_username(new_username)
+
+    if old_normalized == new_normalized:
+        return user
+
+    if get_user_by_username(new_normalized) is not None:
+        raise HTTPException(status_code=409, detail="Username đã tồn tại.")
+
+    user_id = str(user["id"])
+    old_key = username_index_key(old_normalized)
+    new_key = username_index_key(new_normalized)
+    new_index_ref = username_indexes_ref().child(new_key)
+
+    def reserve_index(current):
+        if current is not None:
+            raise ValueError("USERNAME_EXISTS")
+        return user_id
+
+    try:
+        new_index_ref.transaction(reserve_index)
+    except Exception as error:
+        if "USERNAME_EXISTS" in str(error):
+            raise HTTPException(status_code=409, detail="Username đã tồn tại.") from error
+        raise
+
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        root_ref().update(
+            {
+                f"users/{user_id}/username": new_normalized,
+                f"users/{user_id}/username_normalized": new_normalized,
+                f"users/{user_id}/updated_at": now_iso,
+                f"username_indexes/{old_key}": None,
+            }
+        )
+    except Exception:
+        new_index_ref.delete()
+        raise
+
+    return get_user_by_id(user_id)
 
 
 # =========================================================
@@ -969,7 +1318,9 @@ async def lifespan(app: FastAPI):
     global fastapi_loop, cooking_task
 
     init_firebase()
+    validate_auth_configuration()
     await asyncio.to_thread(ensure_item_counter)
+    await asyncio.to_thread(ensure_initial_admin)
 
     fastapi_loop = asyncio.get_running_loop()
 
@@ -1023,6 +1374,177 @@ app.add_middleware(
 
 
 # =========================================================
+# AUTH API
+# =========================================================
+
+@app.post("/auth/login")
+async def login(data: LoginRequest):
+    user = await asyncio.to_thread(authenticate_user, data.username, data.password)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Sai username hoặc password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token, expires_at = create_access_token(user)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires_at.isoformat(),
+        "user": public_user(user),
+    }
+
+
+@app.get("/auth/me")
+def auth_me(current_user: dict = Depends(get_current_user)):
+    return public_user(current_user)
+
+
+@app.post("/auth/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    # Invalidate all JWTs issued before this logout for the account.
+    await asyncio.to_thread(bump_token_version, str(current_user["id"]))
+    return {"message": "Đăng xuất thành công."}
+
+
+@app.patch("/auth/change-password")
+async def change_own_password(
+    data: PasswordChangeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        password_ok = password_hasher.verify(
+            data.current_password,
+            str(current_user.get("password_hash") or ""),
+        )
+    except Exception:
+        password_ok = False
+
+    if not password_ok:
+        raise HTTPException(status_code=400, detail="Mật khẩu hiện tại không đúng.")
+
+    if data.current_password == data.new_password:
+        raise HTTPException(status_code=400, detail="Mật khẩu mới phải khác mật khẩu hiện tại.")
+
+    new_hash = await asyncio.to_thread(password_hasher.hash, data.new_password)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    await asyncio.to_thread(
+        users_ref().child(str(current_user["id"])).update,
+        {
+            "password_hash": new_hash,
+            "updated_at": now_iso,
+        },
+    )
+    await asyncio.to_thread(bump_token_version, str(current_user["id"]))
+
+    return {
+        "message": "Đổi mật khẩu thành công. Hãy đăng nhập lại.",
+        "logout_required": True,
+    }
+
+
+# =========================================================
+# ADMIN USER MANAGEMENT
+# Admin chỉ CRUD tài khoản role=manager.
+# =========================================================
+
+@app.get("/admin/users")
+def list_manager_users(admin_user: dict = Depends(require_admin)):
+    data = users_ref().get() or {}
+    users = []
+
+    if isinstance(data, dict):
+        for user in data.values():
+            if isinstance(user, dict) and str(user.get("role") or "") == "manager":
+                users.append(public_user(user))
+
+    users.sort(key=lambda item: item["username"])
+    return {"users": users}
+
+
+@app.post("/admin/users", status_code=201)
+async def create_manager_user(
+    data: ManagerUserCreate,
+    admin_user: dict = Depends(require_admin),
+):
+    user = await asyncio.to_thread(
+        create_user_record,
+        data.username,
+        data.password,
+        "manager",
+        data.active,
+    )
+    return {"message": "Tạo tài khoản quản lý thành công.", "user": public_user(user)}
+
+
+@app.patch("/admin/users/{user_id}")
+async def update_manager_user(
+    user_id: str,
+    data: ManagerUserUpdate,
+    admin_user: dict = Depends(require_admin),
+):
+    user = await asyncio.to_thread(get_user_by_id, user_id)
+
+    if not user or str(user.get("role") or "") != "manager":
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản quản lý.")
+
+    changed_security_state = False
+
+    if data.username is not None:
+        user = await asyncio.to_thread(change_username, user, data.username)
+
+    updates = {}
+
+    if data.active is not None and bool(user.get("active", True)) != data.active:
+        updates["active"] = data.active
+        changed_security_state = True
+
+    if data.new_password is not None:
+        updates["password_hash"] = await asyncio.to_thread(
+            password_hasher.hash,
+            data.new_password,
+        )
+        changed_security_state = True
+
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(users_ref().child(user_id).update, updates)
+
+    if changed_security_state:
+        await asyncio.to_thread(bump_token_version, user_id)
+
+    updated = await asyncio.to_thread(get_user_by_id, user_id)
+    return {"message": "Cập nhật tài khoản thành công.", "user": public_user(updated)}
+
+
+@app.delete("/admin/users/{user_id}")
+async def delete_manager_user(
+    user_id: str,
+    admin_user: dict = Depends(require_admin),
+):
+    user = await asyncio.to_thread(get_user_by_id, user_id)
+
+    if not user or str(user.get("role") or "") != "manager":
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản quản lý.")
+
+    index_key = username_index_key(str(user.get("username_normalized") or user.get("username") or ""))
+
+    await asyncio.to_thread(
+        root_ref().update,
+        {
+            f"users/{user_id}": None,
+            f"username_indexes/{index_key}": None,
+        },
+    )
+
+    return {"message": "Đã xóa tài khoản quản lý."}
+
+
+# =========================================================
 # API TEST / STATUS
 # =========================================================
 
@@ -1031,16 +1553,15 @@ def home():
     return {
         "message": "Restaurant API đang hoạt động",
         "database": "Firebase Realtime Database",
-        "firebase_database_url": FIREBASE_DATABASE_URL,
-        "firebase_root_path": FIREBASE_ROOT_PATH,
         "total_tables": TOTAL_TABLES,
         "mqtt_configured": MQTT_CONFIGURED,
         "mqtt_connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
+        "auth": "JWT enabled",
     }
 
 
 @app.get("/mqtt/status")
-def mqtt_status():
+def mqtt_status(admin_user: dict = Depends(require_admin)):
     return {
         "configured": MQTT_CONFIGURED,
         "connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
@@ -1061,14 +1582,69 @@ def mqtt_status():
 
 @app.websocket("/ws/dashboard")
 async def dashboard_websocket(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
 
     try:
+        raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        auth_message = json.loads(raw_auth)
+
+        if auth_message.get("type") != "auth" or not auth_message.get("token"):
+            await websocket.close(code=1008, reason="Authentication required")
+            return
+
+        token = str(auth_message["token"])
+
+        try:
+            user = await asyncio.to_thread(verify_access_token, token)
+            token_payload = jwt.decode(
+                token,
+                JWT_SECRET_KEY,
+                algorithms=[JWT_ALGORITHM],
+            )
+            token_exp = float(token_payload["exp"])
+        except (HTTPException, InvalidTokenError, KeyError, TypeError, ValueError):
+            await websocket.close(code=1008, reason="Invalid or expired token")
+            return
+
+        manager.connections.append(websocket)
+        await websocket.send_json(
+            {
+                "type": "auth_ok",
+                "user": public_user(user),
+            }
+        )
+
         while True:
-            await websocket.receive_text()
+            remaining_seconds = token_exp - datetime.now(timezone.utc).timestamp()
+
+            if remaining_seconds <= 0:
+                manager.disconnect(websocket)
+                await websocket.close(code=1008, reason="Token expired")
+                return
+
+            try:
+                await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=min(60.0, remaining_seconds),
+                )
+            except asyncio.TimeoutError:
+                # Kiểm tra lại active/token_version định kỳ và đúng lúc JWT hết hạn.
+                try:
+                    await asyncio.to_thread(verify_access_token, token)
+                except HTTPException:
+                    manager.disconnect(websocket)
+                    await websocket.close(code=1008, reason="Session expired")
+                    return
+
+    except asyncio.TimeoutError:
+        try:
+            await websocket.close(code=1008, reason="Authentication timeout")
+        except Exception:
+            pass
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-    except Exception:
+    except Exception as error:
+        print("[WS] dashboard error:", repr(error))
         manager.disconnect(websocket)
 
 
@@ -1163,7 +1739,7 @@ async def create_order(order: OrderCreate):
 # =========================================================
 
 @app.get("/orders")
-def get_all_orders():
+def get_all_orders(current_user: dict = Depends(get_current_user)):
     return get_all_items()
 
 
@@ -1172,7 +1748,7 @@ def get_all_orders():
 # =========================================================
 
 @app.get("/orders/tables/status")
-def get_table_statuses():
+def get_table_statuses(current_user: dict = Depends(get_current_user)):
     items = get_all_items()
 
     by_table = {
@@ -1212,7 +1788,8 @@ def get_table_statuses():
     "/orders/table/{table_number}"
 )
 async def get_orders_by_table(
-    table_number: int
+    table_number: int,
+    current_user: dict = Depends(get_current_user),
 ):
 
     if (
@@ -1282,7 +1859,10 @@ async def get_orders_by_table(
 # =========================================================
 
 @app.get("/orders/table/{table_number}/pending")
-def get_pending_orders_by_table(table_number: int):
+def get_pending_orders_by_table(
+    table_number: int,
+    current_user: dict = Depends(get_current_user),
+):
     if table_number <= 0 or table_number > TOTAL_TABLES:
         raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
@@ -1342,7 +1922,11 @@ def update_delivery_status_in_firebase(item_id: int, delivered: bool):
 
 
 @app.patch("/order-items/{item_id}/delivered")
-async def update_delivery_status(item_id: int, data: DeliveryUpdate):
+async def update_delivery_status(
+    item_id: int,
+    data: DeliveryUpdate,
+    current_user: dict = Depends(get_current_user),
+):
     item, delivery_status = await asyncio.to_thread(
         update_delivery_status_in_firebase,
         item_id,
@@ -1388,7 +1972,11 @@ def update_quantity_in_firebase(item_id: int, quantity: int):
 
 
 @app.patch("/order-items/{item_id}/quantity")
-async def update_quantity(item_id: int, data: QuantityUpdate):
+async def update_quantity(
+    item_id: int,
+    data: QuantityUpdate,
+    current_user: dict = Depends(get_current_user),
+):
     item, summary, item_total = await asyncio.to_thread(
         update_quantity_in_firebase,
         item_id,
@@ -1499,7 +2087,11 @@ def update_table_items_in_firebase(table_number: int, edits: list[OrderItemEdit]
 
 
 @app.patch("/orders/table/{table_number}/items")
-async def update_table_items(table_number: int, data: TableItemsUpdate):
+async def update_table_items(
+    table_number: int,
+    data: TableItemsUpdate,
+    current_user: dict = Depends(get_current_user),
+):
     if table_number <= 0 or table_number > TOTAL_TABLES:
         raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
@@ -1586,7 +2178,11 @@ def mark_robot_dispatch_failed(item_id: int, command_id: str):
 
 
 @app.patch("/order-items/{item_id}/robot-dispatch")
-async def dispatch_order_to_robot(item_id: int, data: RobotDispatchUpdate):
+async def dispatch_order_to_robot(
+    item_id: int,
+    data: RobotDispatchUpdate,
+    current_user: dict = Depends(get_current_user),
+):
     if data.robot not in (1, 2):
         raise HTTPException(status_code=400, detail="Robot không hợp lệ.")
 
@@ -1702,7 +2298,10 @@ def checkout_table_in_firebase(table_number: int):
 
 
 @app.delete("/orders/table/{table_number}")
-async def checkout_and_delete_table(table_number: int):
+async def checkout_and_delete_table(
+    table_number: int,
+    current_user: dict = Depends(get_current_user),
+):
     if table_number <= 0 or table_number > TOTAL_TABLES:
         raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
@@ -1730,7 +2329,7 @@ async def checkout_and_delete_table(table_number: int):
 
 ## Debug API
 @app.get("/debug/cooking")
-async def debug_cooking():
+async def debug_cooking(admin_user: dict = Depends(require_admin)):
 
     try:
 
