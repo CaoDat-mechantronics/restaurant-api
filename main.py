@@ -2576,3 +2576,285 @@ async def debug_cooking(admin_user: dict = Depends(require_admin)):
             "error":
                 repr(error),
         }
+
+# =========================================================
+# ROBOT AI / GEMINI LIVE ADD-ON
+# Chỉ bổ sung API mới, không đổi API cũ.
+# =========================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_LIVE_MODEL = os.getenv(
+    "GEMINI_LIVE_MODEL",
+    "gemini-3.1-flash-live-preview",
+).strip()
+
+
+class RobotAICheckFoodRequest(BaseModel):
+    table_number: int = Field(ge=1, le=TOTAL_TABLES)
+    food_name: str = Field(min_length=1, max_length=200)
+
+
+class RobotAIDispatchRequest(BaseModel):
+    item_id: int = Field(gt=0)
+    table_number: int = Field(ge=1, le=TOTAL_TABLES)
+    robot: int = Field(ge=1, le=2)
+
+
+def robot_ai_normalize_food_name(value: str) -> str:
+    import unicodedata
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def robot_ai_calculate_route(table_number: int) -> dict:
+    table_number = int(table_number)
+    if 1 <= table_number <= 5:
+        return {
+            "table": table_number,
+            "line": 1,
+            "junction_turn": "LEFT",
+            "junction_turn_vi": "Rẽ trái",
+            "stop_index": table_number,
+        }
+    if 6 <= table_number <= 10:
+        return {
+            "table": table_number,
+            "line": 2,
+            "junction_turn": "RIGHT",
+            "junction_turn_vi": "Rẽ phải",
+            "stop_index": table_number - 5,
+        }
+    raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+
+
+def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
+    from difflib import get_close_matches
+
+    items = get_items_by_table(table_number)
+    requested_norm = robot_ai_normalize_food_name(requested_food)
+
+    pending = [item for item in items if not bool(item.get("delivered"))]
+    exact = [
+        item for item in pending
+        if robot_ai_normalize_food_name(item.get("food_name", "")) == requested_norm
+    ]
+
+    if not exact:
+        substring = [
+            item for item in pending
+            if requested_norm and (
+                requested_norm in robot_ai_normalize_food_name(item.get("food_name", ""))
+                or robot_ai_normalize_food_name(item.get("food_name", "")) in requested_norm
+            )
+        ]
+        unique_names = {
+            robot_ai_normalize_food_name(item.get("food_name", ""))
+            for item in substring
+        }
+        if len(unique_names) == 1:
+            exact = substring
+
+    available_foods = sorted({
+        str(item.get("food_name") or "")
+        for item in pending
+        if str(item.get("food_name") or "").strip()
+    })
+    route = robot_ai_calculate_route(table_number)
+
+    if not exact:
+        normalized_map = {
+            robot_ai_normalize_food_name(name): name
+            for name in available_foods
+        }
+        suggestions = [
+            normalized_map[name]
+            for name in get_close_matches(
+                requested_norm,
+                list(normalized_map.keys()),
+                n=3,
+                cutoff=0.55,
+            )
+        ]
+        return {
+            "found": False,
+            "deliverable": False,
+            "table_number": table_number,
+            "requested_food": requested_food,
+            "available_foods": available_foods,
+            "suggestions": suggestions,
+            "route": route,
+            "message": f"Bàn {table_number} không có món '{requested_food}' trong các món chưa giao.",
+        }
+
+    exact.sort(
+        key=lambda item: (
+            int(item.get("cooking_status") or 0) >= 2,
+            not bool(item.get("robot_dispatched")),
+            int(item.get("id") or 0),
+        ),
+        reverse=True,
+    )
+    item = exact[0]
+    cooking_status = int(item.get("cooking_status") or 0)
+    dispatched = bool(item.get("robot_dispatched"))
+    delivered = bool(item.get("delivered"))
+    deliverable = cooking_status >= 2 and not dispatched and not delivered
+
+    if cooking_status < 2:
+        message = "Món có trong đơn nhưng chưa nấu xong."
+    elif dispatched:
+        message = "Món đã được dispatch trước đó."
+    elif delivered:
+        message = "Món đã được giao."
+    else:
+        message = "Món đã sẵn sàng để giao."
+
+    return {
+        "found": True,
+        "deliverable": deliverable,
+        "table_number": table_number,
+        "requested_food": requested_food,
+        "item": item,
+        "route": route,
+        "available_foods": available_foods,
+        "message": message,
+    }
+
+
+def robot_ai_create_ephemeral_token() -> dict:
+    import urllib.error
+    import urllib.request
+
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Chưa cấu hình GEMINI_API_KEY.")
+
+    now = datetime.now(timezone.utc)
+    expire_time = now + timedelta(minutes=30)
+    new_session_expire_time = now + timedelta(minutes=2)
+
+    def rfc3339(dt):
+        return dt.isoformat().replace("+00:00", "Z")
+
+    # AuthToken REST body. uses=1 giúp token dùng một lần; key dài hạn chỉ ở backend.
+    payload = {
+        "uses": 1,
+        "expireTime": rfc3339(expire_time),
+        "newSessionExpireTime": rfc3339(new_session_expire_time),
+    }
+
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Gemini auth token lỗi: {details}") from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Không tạo được Gemini token: {error}") from error
+
+    token_name = str(data.get("name") or "")
+    if not token_name:
+        raise HTTPException(status_code=502, detail="Gemini không trả token hợp lệ.")
+
+    return {
+        "token": token_name,
+        "model": GEMINI_LIVE_MODEL,
+        "expire_time": rfc3339(expire_time),
+        "new_session_expire_time": rfc3339(new_session_expire_time),
+    }
+
+
+@app.get("/robot-ai/status")
+def robot_ai_status(current_user: dict = Depends(get_current_user)):
+    return {
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_model": GEMINI_LIVE_MODEL,
+        "mqtt_configured": MQTT_CONFIGURED,
+        "mqtt_connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
+        "total_tables": TOTAL_TABLES,
+    }
+
+
+@app.post("/robot-ai/gemini-token")
+async def robot_ai_gemini_token(current_user: dict = Depends(get_current_user)):
+    return await asyncio.to_thread(robot_ai_create_ephemeral_token)
+
+
+@app.post("/robot-ai/check-food")
+async def robot_ai_check_food(
+    data: RobotAICheckFoodRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    return await asyncio.to_thread(robot_ai_find_food, data.table_number, data.food_name)
+
+
+@app.post("/robot-ai/dispatch")
+async def robot_ai_dispatch(
+    data: RobotAIDispatchRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    item = await asyncio.to_thread(get_item, data.item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+    if int(item["table_number"]) != int(data.table_number):
+        raise HTTPException(status_code=409, detail="Món không thuộc bàn được yêu cầu.")
+    if bool(item["delivered"]):
+        raise HTTPException(status_code=409, detail="Món đã được giao.")
+    if bool(item["robot_dispatched"]):
+        raise HTTPException(status_code=409, detail="Món đã được dispatch trước đó.")
+    if int(item.get("cooking_status") or 0) < 2:
+        raise HTTPException(status_code=409, detail="Món chưa nấu xong nên chưa thể giao.")
+
+    command_id = uuid.uuid4().hex[:8].upper()
+    route = robot_ai_calculate_route(data.table_number)
+    item = await asyncio.to_thread(
+        prepare_robot_dispatch,
+        data.item_id,
+        data.robot,
+        command_id,
+    )
+    topic = mqtt_topic_for_robot(data.robot)
+    payload = {
+        "command_id": command_id,
+        "robot": data.robot,
+        "item_id": data.item_id,
+        "table": data.table_number,
+        "food_name": item["food_name"],
+        "action": "deliver",
+        "route": {
+            "line": route["line"],
+            "junction_turn": route["junction_turn"],
+            "stop_index": route["stop_index"],
+        },
+    }
+
+    try:
+        await asyncio.to_thread(publish_robot_command, topic, payload)
+    except HTTPException:
+        await asyncio.to_thread(mark_robot_dispatch_failed, data.item_id, command_id)
+        raise
+
+    event = {
+        "type": "robot_ai_dispatched",
+        "item_id": data.item_id,
+        "table": data.table_number,
+        "food_name": item["food_name"],
+        "robot": data.robot,
+        "command_id": command_id,
+        "topic": topic,
+        "route": route,
+        "delivery_status": "dispatched",
+    }
+    await broadcast_event(event)
+    return {"message": "Đã gửi lệnh giao món tới robot.", **event}
