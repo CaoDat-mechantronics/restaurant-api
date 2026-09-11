@@ -879,20 +879,32 @@ def delivery_route_for_table(table_number: int) -> dict:
 
 
 def ensure_robot_registry():
-    """Tạo robot_1/robot_2 nếu chưa có, không ghi đè trạng thái cũ."""
+    """Tạo robot_1/robot_2 nếu chưa có và bổ sung các field còn thiếu."""
     now = utc_now_iso()
 
     for robot_number in (1, 2):
         ref = robot_ref(robot_number)
         current = ref.get()
 
+        # Robot đã tồn tại: không ghi đè dữ liệu cũ, chỉ bổ sung field mới.
         if isinstance(current, dict):
+            missing_fields = {}
+
+            if "has_food" not in current:
+                missing_fields["has_food"] = False
+
+            if missing_fields:
+                missing_fields["updated_at"] = now
+                ref.update(missing_fields)
+
             continue
 
+        # Robot chưa từng tồn tại trong Firebase.
         ref.set(
             {
                 "name": f"Robot {robot_number}",
                 "status": "disconnected",
+                "has_food": False,
                 "tasks": "",
                 "wifi_connected": False,
                 "last_heartbeat": "",
@@ -1002,6 +1014,24 @@ def record_robot_heartbeat(robot_number: int, payload: dict) -> tuple[dict, bool
         "last_heartbeat": now_iso,
         "updated_at": now_iso,
     }
+
+    # has_food được ESP32 gửi kèm heartbeat.
+    # true  = robot đang có món/đĩa
+    # false = robot không có món/đĩa
+    if "has_food" in payload:
+        raw_has_food = payload.get("has_food")
+
+        if isinstance(raw_has_food, bool):
+            update["has_food"] = raw_has_food
+        elif isinstance(raw_has_food, (int, float)):
+            update["has_food"] = bool(raw_has_food)
+        elif isinstance(raw_has_food, str):
+            update["has_food"] = raw_has_food.strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
 
     if "ip" in payload:
         update["ip"] = str(payload.get("ip") or "")
@@ -1260,6 +1290,7 @@ def on_mqtt_message(client, userdata, message):
            "type": "heartbeat",
            "robot": 1,
            "wifi_connected": true,
+           "has_food": false,
            "ip": "192.168.1.20",
            "rssi": -55,
            "uptime_ms": 123456
