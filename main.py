@@ -54,6 +54,15 @@ MQTT_CONFIGURED = bool(
     and MQTT_PASSWORD
 )
 
+# Robot heartbeat / presence
+ROBOT_HEARTBEAT_TIMEOUT_SECONDS = int(
+    os.getenv("ROBOT_HEARTBEAT_TIMEOUT_SECONDS", "20")
+)
+ROBOT_WATCHDOG_INTERVAL_SECONDS = int(
+    os.getenv("ROBOT_WATCHDOG_INTERVAL_SECONDS", "2")
+)
+
+
 # CORS. Ví dụ:
 # CORS_ORIGINS=https://your-frontend.pages.dev,https://example.com
 # Để * trong giai đoạn phát triển.
@@ -292,6 +301,14 @@ def users_ref():
 
 def username_indexes_ref():
     return db.reference(firebase_path("username_indexes"))
+
+
+def robots_ref():
+    return db.reference(firebase_path("robot"))
+
+
+def robot_ref(robot_number: int):
+    return db.reference(firebase_path(f"robot/robot_{int(robot_number)}"))
 
 
 # =========================================================
@@ -814,6 +831,296 @@ def reserve_item_ids(count: int) -> list[int]:
 
 
 # =========================================================
+# ROBOT REGISTRY / HEARTBEAT
+# Firebase: /restaurant/robot/robot_1, /robot_2
+# =========================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc_iso(value: str):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def robot_number_from_status_topic(topic: str) -> int | None:
+    match = re.fullmatch(r"topic([12])/status", str(topic or ""))
+    return int(match.group(1)) if match else None
+
+
+def delivery_route_for_table(table_number: int) -> dict:
+    table_number = int(table_number)
+
+    if 1 <= table_number <= 5:
+        return {
+            "table": table_number,
+            "line": 1,
+            "junction_turn": "LEFT",
+            "junction_turn_vi": "Rẽ trái",
+            "stop_index": table_number,
+        }
+
+    if 6 <= table_number <= 10:
+        return {
+            "table": table_number,
+            "line": 2,
+            "junction_turn": "RIGHT",
+            "junction_turn_vi": "Rẽ phải",
+            "stop_index": table_number - 5,
+        }
+
+    raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+
+
+def ensure_robot_registry():
+    """Tạo robot_1/robot_2 nếu chưa có, không ghi đè trạng thái cũ."""
+    now = utc_now_iso()
+
+    for robot_number in (1, 2):
+        ref = robot_ref(robot_number)
+        current = ref.get()
+
+        if isinstance(current, dict):
+            continue
+
+        ref.set(
+            {
+                "name": f"Robot {robot_number}",
+                "status": "disconnected",
+                "tasks": "",
+                "wifi_connected": False,
+                "last_heartbeat": "",
+                "updated_at": now,
+            }
+        )
+
+
+def get_robot_state(robot_number: int) -> dict:
+    data = robot_ref(robot_number).get()
+    return data if isinstance(data, dict) else {}
+
+
+def heartbeat_age_seconds(state: dict, now: datetime | None = None) -> float | None:
+    last = parse_utc_iso(state.get("last_heartbeat"))
+    if last is None:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (now - last).total_seconds())
+
+
+def mark_robot_disconnected(robot_number: int, now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat().replace("+00:00", "Z")
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+
+    # Giữ nguyên tasks nếu robot rớt mạng giữa lúc đang giao để còn biết
+    # nhiệm vụ nào đã bị gián đoạn.
+    ref.update(
+        {
+            "status": "disconnected",
+            "wifi_connected": False,
+            "disconnected_at": now_iso,
+            "updated_at": now_iso,
+        }
+    )
+
+    current.update(
+        {
+            "status": "disconnected",
+            "wifi_connected": False,
+            "disconnected_at": now_iso,
+            "updated_at": now_iso,
+        }
+    )
+    return current
+
+
+def refresh_robot_presence(robot_number: int) -> dict:
+    state = get_robot_state(robot_number)
+    age = heartbeat_age_seconds(state)
+
+    if age is None or age >= ROBOT_HEARTBEAT_TIMEOUT_SECONDS:
+        if state.get("status") != "disconnected" or state.get("wifi_connected") is not False:
+            state = mark_robot_disconnected(robot_number)
+
+    return state
+
+
+def require_robot_available(robot_number: int) -> dict:
+    state = refresh_robot_presence(robot_number)
+    robot_name = str(state.get("name") or f"Robot {robot_number}")
+    robot_status = str(state.get("status") or "disconnected")
+
+    if robot_status == "disconnected":
+        raise HTTPException(
+            status_code=409,
+            detail=(f"{robot_name} đang disconnected hoặc đã quá "
+                    f"{ROBOT_HEARTBEAT_TIMEOUT_SECONDS} giây không có heartbeat."),
+        )
+
+    if robot_status == "on_task":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{robot_name} đang thực hiện nhiệm vụ khác.",
+        )
+
+    if robot_status != "available":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{robot_name} chưa sẵn sàng (status={robot_status}).",
+        )
+
+    return state
+
+
+def record_robot_heartbeat(robot_number: int, payload: dict) -> tuple[dict, bool]:
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    previous_status = str(current.get("status") or "disconnected")
+    current_tasks = current.get("tasks", "")
+
+    # Nếu còn task đang giữ trong DB thì heartbeat chỉ xác nhận robot sống;
+    # trạng thái phải quay lại on_task chứ không được tự đổi available.
+    has_active_task = isinstance(current_tasks, dict) and bool(current_tasks)
+    new_status = "on_task" if has_active_task else "available"
+    now_iso = utc_now_iso()
+
+    update = {
+        "name": f"Robot {robot_number}",
+        "status": new_status,
+        "wifi_connected": True,
+        "last_heartbeat": now_iso,
+        "updated_at": now_iso,
+    }
+
+    if "ip" in payload:
+        update["ip"] = str(payload.get("ip") or "")
+    if "rssi" in payload:
+        try:
+            update["rssi"] = int(payload.get("rssi"))
+        except (TypeError, ValueError):
+            pass
+    if "uptime_ms" in payload:
+        try:
+            update["uptime_ms"] = int(payload.get("uptime_ms"))
+        except (TypeError, ValueError):
+            pass
+
+    ref.update(update)
+    result = {**current, **update}
+    return result, previous_status != new_status
+
+
+def set_robot_on_task(
+    robot_number: int,
+    *,
+    item_id: int,
+    table_number: int,
+    food_name: str,
+    command_id: str,
+) -> dict:
+    route = delivery_route_for_table(table_number)
+    now_iso = utc_now_iso()
+    task = {
+        "command_id": str(command_id),
+        "item_id": int(item_id),
+        "food_name": str(food_name),
+        "table": int(table_number),
+        "junction_turn": route["junction_turn"],
+        "junction_turn_vi": route["junction_turn_vi"],
+        "line": int(route["line"]),
+        "stop_index": int(route["stop_index"]),
+        "started_at": now_iso,
+    }
+
+    robot_ref(robot_number).update(
+        {
+            "status": "on_task",
+            "tasks": task,
+            "updated_at": now_iso,
+        }
+    )
+    return task
+
+
+def finish_robot_task(robot_number: int, command_id: str = "") -> bool:
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    task = current.get("tasks")
+
+    if isinstance(task, dict):
+        active_command_id = str(task.get("command_id") or "")
+        if active_command_id and command_id and active_command_id != str(command_id):
+            return False
+
+    now_iso = utc_now_iso()
+    ref.update(
+        {
+            "status": "available",
+            "tasks": "",
+            "wifi_connected": True,
+            "last_heartbeat": now_iso,
+            "updated_at": now_iso,
+        }
+    )
+    return True
+
+
+def mark_stale_robots_once() -> list[dict]:
+    changes = []
+    now = datetime.now(timezone.utc)
+
+    for robot_number in (1, 2):
+        state = get_robot_state(robot_number)
+        age = heartbeat_age_seconds(state, now=now)
+        stale = age is None or age >= ROBOT_HEARTBEAT_TIMEOUT_SECONDS
+
+        if stale and str(state.get("status") or "") != "disconnected":
+            state = mark_robot_disconnected(robot_number, now=now)
+            changes.append(
+                {
+                    "type": "robot_status",
+                    "robot": robot_number,
+                    "status": "disconnected",
+                    "tasks": state.get("tasks", ""),
+                    "wifi_connected": False,
+                }
+            )
+
+    return changes
+
+
+async def robot_watchdog_worker():
+    print(
+        f"[ROBOT] Heartbeat watchdog started: timeout={ROBOT_HEARTBEAT_TIMEOUT_SECONDS}s"
+    )
+
+    while True:
+        try:
+            changes = await asyncio.to_thread(mark_stale_robots_once)
+            for change in changes:
+                await broadcast_event(change)
+        except asyncio.CancelledError:
+            print("[ROBOT] Heartbeat watchdog stopped")
+            raise
+        except Exception as error:
+            print("[ROBOT] Heartbeat watchdog error:", repr(error))
+
+        await asyncio.sleep(max(1, ROBOT_WATCHDOG_INTERVAL_SECONDS))
+
+
+# =========================================================
 # WEBSOCKET MANAGER
 # =========================================================
 
@@ -894,6 +1201,7 @@ manager = ConnectionManager()
 menu_manager = MenuConnectionManager()
 fastapi_loop = None
 cooking_task = None
+robot_watchdog_task = None
 
 
 async def broadcast_event(data: dict):
@@ -945,27 +1253,81 @@ def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properti
 
 def on_mqtt_message(client, userdata, message):
     """
-    Robot gửi ví dụ:
-    {
-        "command_id": "AB12CD34",
-        "robot": 2,
-        "item_id": 25,
-        "table": 3,
-        "food_name": "Pizza Hải Sản",
-        "status": "delivered"
-    }
+    topicN/status nhận 2 loại message:
+
+    1) Heartbeat mỗi 10 giây:
+       {
+           "type": "heartbeat",
+           "robot": 1,
+           "wifi_connected": true,
+           "ip": "192.168.1.20",
+           "rssi": -55,
+           "uptime_ms": 123456
+       }
+
+    2) Robot báo giao xong (giữ tương thích payload cũ):
+       {
+           "command_id": "AB12CD34",
+           "robot": 2,
+           "item_id": 25,
+           "table": 3,
+           "food_name": "Pizza Hải Sản",
+           "status": "delivered"
+       }
     """
     try:
         payload = json.loads(message.payload.decode("utf-8"))
         print(f"[MQTT] RECEIVE {message.topic}: {payload}")
 
-        if payload.get("status") != "delivered":
+        topic_robot = robot_number_from_status_topic(message.topic)
+        if topic_robot is None:
+            print(f"[MQTT] Bỏ qua topic status không hợp lệ: {message.topic}")
+            return
+
+        message_type = str(payload.get("type") or "").strip().lower()
+        message_status = str(payload.get("status") or "").strip().lower()
+
+        # -------------------------------------------------
+        # HEARTBEAT
+        # -------------------------------------------------
+        if message_type == "heartbeat" or message_status == "heartbeat":
+            payload_robot = payload.get("robot")
+            if payload_robot is not None and int(payload_robot) != topic_robot:
+                print("[MQTT] Bỏ qua heartbeat: robot trong payload không khớp topic")
+                return
+
+            robot_state, changed = record_robot_heartbeat(topic_robot, payload)
+            print(
+                f"[ROBOT] Robot {topic_robot} heartbeat -> "
+                f"{robot_state.get('status')}"
+            )
+
+            if changed:
+                broadcast_from_mqtt_thread(
+                    {
+                        "type": "robot_status",
+                        "robot": topic_robot,
+                        "status": robot_state.get("status"),
+                        "tasks": robot_state.get("tasks", ""),
+                        "wifi_connected": True,
+                    }
+                )
+            return
+
+        # -------------------------------------------------
+        # DELIVERY STATUS CŨ
+        # -------------------------------------------------
+        if message_status != "delivered":
             return
 
         item_id = int(payload["item_id"])
         table_number = int(payload["table"])
         robot_number = int(payload["robot"])
         command_id = str(payload.get("command_id") or "")
+
+        if robot_number != topic_robot:
+            print("[MQTT] Bỏ qua delivered: robot không khớp topic")
+            return
 
         item = get_item(item_id)
 
@@ -989,8 +1351,10 @@ def on_mqtt_message(client, userdata, message):
             print("[MQTT] Bỏ qua: command_id cũ hoặc không hợp lệ")
             return
 
-        # QoS 1 có thể gửi lặp. Nếu đã delivered thì xử lý idempotent.
+        # QoS 1 có thể gửi lặp. Nếu đã delivered thì vẫn cho robot trở về
+        # available nếu đúng command_id, nhưng không update item lần nữa.
         if bool(item["delivered"]):
+            finish_robot_task(robot_number, command_id)
             print(f"[MQTT] item_id={item_id} đã delivered trước đó")
             return
 
@@ -1001,6 +1365,7 @@ def on_mqtt_message(client, userdata, message):
             }
         )
 
+        finish_robot_task(robot_number, command_id)
         food_name = item["food_name"]
 
         print(
@@ -1370,12 +1735,13 @@ async def cooking_status_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global fastapi_loop, cooking_task
+    global fastapi_loop, cooking_task, robot_watchdog_task
 
     init_firebase()
     validate_auth_configuration()
     await asyncio.to_thread(ensure_item_counter)
     await asyncio.to_thread(ensure_initial_admin)
+    await asyncio.to_thread(ensure_robot_registry)
 
     fastapi_loop = asyncio.get_running_loop()
 
@@ -1390,6 +1756,7 @@ async def lifespan(app: FastAPI):
         print("[MQTT] Chưa cấu hình HiveMQ. REST/WebSocket vẫn chạy bình thường.")
 
     cooking_task = asyncio.create_task(cooking_status_worker())
+    robot_watchdog_task = asyncio.create_task(robot_watchdog_worker())
 
     try:
         yield
@@ -1398,6 +1765,13 @@ async def lifespan(app: FastAPI):
             cooking_task.cancel()
             try:
                 await cooking_task
+            except asyncio.CancelledError:
+                pass
+
+        if robot_watchdog_task is not None:
+            robot_watchdog_task.cancel()
+            try:
+                await robot_watchdog_task
             except asyncio.CancelledError:
                 pass
 
@@ -1982,6 +2356,12 @@ def update_delivery_status_in_firebase(item_id: int, delivered: bool):
         }
     )
 
+    if bool(delivered) and item.get("assigned_robot") is not None:
+        finish_robot_task(
+            int(item["assigned_robot"]),
+            str(item.get("dispatch_command_id") or ""),
+        )
+
     return item, delivery_status
 
 
@@ -2393,6 +2773,8 @@ async def dispatch_order_to_robot(
     if data.robot not in (1, 2):
         raise HTTPException(status_code=400, detail="Robot không hợp lệ.")
 
+    await asyncio.to_thread(require_robot_available, data.robot)
+
     # Đảm bảo trạng thái nấu vừa được tính trước khi kiểm tra.
     cooking_changes = await asyncio.to_thread(update_cooking_statuses_once)
     for change in cooking_changes:
@@ -2434,6 +2816,15 @@ async def dispatch_order_to_robot(
         )
         raise
 
+    task = await asyncio.to_thread(
+        set_robot_on_task,
+        data.robot,
+        item_id=item_id,
+        table_number=table_number,
+        food_name=food_name,
+        command_id=command_id,
+    )
+
     event = {
         "type": "robot_dispatched",
         "item_id": item_id,
@@ -2444,6 +2835,7 @@ async def dispatch_order_to_robot(
         "topic": topic,
         "robot_dispatched": True,
         "delivery_status": "dispatched",
+        "task": task,
     }
 
     await broadcast_event(event)
@@ -2609,24 +3001,7 @@ def robot_ai_normalize_food_name(value: str) -> str:
 
 
 def robot_ai_calculate_route(table_number: int) -> dict:
-    table_number = int(table_number)
-    if 1 <= table_number <= 5:
-        return {
-            "table": table_number,
-            "line": 1,
-            "junction_turn": "LEFT",
-            "junction_turn_vi": "Rẽ trái",
-            "stop_index": table_number,
-        }
-    if 6 <= table_number <= 10:
-        return {
-            "table": table_number,
-            "line": 2,
-            "junction_turn": "RIGHT",
-            "junction_turn_vi": "Rẽ phải",
-            "stop_index": table_number - 5,
-        }
-    raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+    return delivery_route_for_table(table_number)
 
 
 def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
@@ -2783,6 +3158,10 @@ def robot_ai_status(current_user: dict = Depends(get_current_user)):
         "mqtt_configured": MQTT_CONFIGURED,
         "mqtt_connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
         "total_tables": TOTAL_TABLES,
+        "robots": {
+            "robot_1": refresh_robot_presence(1),
+            "robot_2": refresh_robot_presence(2),
+        },
     }
 
 
@@ -2816,6 +3195,8 @@ async def robot_ai_dispatch(
     if int(item.get("cooking_status") or 0) < 2:
         raise HTTPException(status_code=409, detail="Món chưa nấu xong nên chưa thể giao.")
 
+    await asyncio.to_thread(require_robot_available, data.robot)
+
     command_id = uuid.uuid4().hex[:8].upper()
     route = robot_ai_calculate_route(data.table_number)
     item = await asyncio.to_thread(
@@ -2845,6 +3226,15 @@ async def robot_ai_dispatch(
         await asyncio.to_thread(mark_robot_dispatch_failed, data.item_id, command_id)
         raise
 
+    task = await asyncio.to_thread(
+        set_robot_on_task,
+        data.robot,
+        item_id=data.item_id,
+        table_number=data.table_number,
+        food_name=item["food_name"],
+        command_id=command_id,
+    )
+
     event = {
         "type": "robot_ai_dispatched",
         "item_id": data.item_id,
@@ -2855,6 +3245,7 @@ async def robot_ai_dispatch(
         "topic": topic,
         "route": route,
         "delivery_status": "dispatched",
+        "task": task,
     }
     await broadcast_event(event)
     return {"message": "Đã gửi lệnh giao món tới robot.", **event}
