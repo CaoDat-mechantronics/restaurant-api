@@ -1083,6 +1083,57 @@ def set_robot_on_task(
     return task
 
 
+def update_robot_has_food(robot_number: int, has_food: bool) -> dict:
+    now_iso = utc_now_iso()
+    ref = robot_ref(robot_number)
+    ref.update(
+        {
+            "has_food": bool(has_food),
+            "updated_at": now_iso,
+        }
+    )
+    current = ref.get()
+    return current if isinstance(current, dict) else {}
+
+
+def rollback_frontend_dispatch(item_id: int, robot_number: int, command_id: str) -> bool:
+    item = get_item(item_id)
+    if item is None:
+        return False
+
+    if str(item.get("dispatch_command_id") or "") != str(command_id):
+        return False
+
+    if bool(item.get("delivered")):
+        return False
+
+    item_ref(item_id).update(
+        {
+            "assigned_robot": None,
+            "robot_dispatched": False,
+            "delivery_status": "waiting",
+            "dispatch_command_id": None,
+        }
+    )
+
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    task = current.get("tasks")
+
+    if isinstance(task, dict) and str(task.get("command_id") or "") == str(command_id):
+        ref.update(
+            {
+                "status": "available",
+                "tasks": "",
+                # has_food cố ý giữ nguyên: món vẫn có thể đang nằm trên robot.
+                "updated_at": utc_now_iso(),
+            }
+        )
+
+    return True
+
+
 def finish_robot_task(robot_number: int, command_id: str = "") -> bool:
     ref = robot_ref(robot_number)
     current = ref.get()
@@ -3023,6 +3074,24 @@ class RobotAIDispatchRequest(BaseModel):
     robot: int = Field(ge=1, le=2)
 
 
+class RobotAIConfirmDispatchRequest(BaseModel):
+    item_id: int = Field(gt=0)
+    table_number: int = Field(ge=1, le=TOTAL_TABLES)
+    robot: int = Field(ge=1, le=2)
+    has_food: bool
+
+
+class RobotAISensorStateRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    has_food: bool
+
+
+class RobotAICancelDispatchRequest(BaseModel):
+    item_id: int = Field(gt=0)
+    robot: int = Field(ge=1, le=2)
+    command_id: str = Field(min_length=1, max_length=64)
+
+
 def robot_ai_normalize_food_name(value: str) -> str:
     import unicodedata
     text = str(value or "").strip().lower()
@@ -3207,6 +3276,116 @@ async def robot_ai_check_food(
     current_user: dict = Depends(get_current_user),
 ):
     return await asyncio.to_thread(robot_ai_find_food, data.table_number, data.food_name)
+
+
+@app.post("/robot-ai/sensor-state")
+async def robot_ai_sensor_state(
+    data: RobotAISensorStateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    state = await asyncio.to_thread(
+        update_robot_has_food,
+        data.robot,
+        data.has_food,
+    )
+
+    event = {
+        "type": "robot_sensor_state",
+        "robot": data.robot,
+        "has_food": bool(data.has_food),
+    }
+    await broadcast_event(event)
+    return {"message": "Đã cập nhật has_food.", "robot_state": state, **event}
+
+
+@app.post("/robot-ai/confirm-dispatch")
+async def robot_ai_confirm_dispatch(
+    data: RobotAIConfirmDispatchRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    # Endpoint này CHỈ cập nhật database.
+    # Frontend sẽ publish task/motor trực tiếp tới HiveMQ bằng MQTT over WebSocket.
+    if not data.has_food:
+        raise HTTPException(status_code=409, detail="Chưa có món trên robot (has_food=false).")
+
+    item = await asyncio.to_thread(get_item, data.item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món.")
+    if int(item["table_number"]) != int(data.table_number):
+        raise HTTPException(status_code=409, detail="Món không thuộc bàn được yêu cầu.")
+    if bool(item["delivered"]):
+        raise HTTPException(status_code=409, detail="Món đã được giao.")
+    if bool(item["robot_dispatched"]):
+        raise HTTPException(status_code=409, detail="Món đã được dispatch trước đó.")
+    if int(item.get("cooking_status") or 0) < 2:
+        raise HTTPException(status_code=409, detail="Món chưa nấu xong nên chưa thể giao.")
+
+    await asyncio.to_thread(require_robot_available, data.robot)
+
+    command_id = uuid.uuid4().hex[:8].upper()
+    route = robot_ai_calculate_route(data.table_number)
+
+    item = await asyncio.to_thread(
+        prepare_robot_dispatch,
+        data.item_id,
+        data.robot,
+        command_id,
+    )
+
+    task = await asyncio.to_thread(
+        set_robot_on_task,
+        data.robot,
+        item_id=data.item_id,
+        table_number=data.table_number,
+        food_name=item["food_name"],
+        command_id=command_id,
+    )
+
+    await asyncio.to_thread(update_robot_has_food, data.robot, True)
+
+    event = {
+        "type": "robot_frontend_dispatched",
+        "item_id": data.item_id,
+        "table": data.table_number,
+        "food_name": item["food_name"],
+        "robot": data.robot,
+        "command_id": command_id,
+        "route": route,
+        "delivery_status": "dispatched",
+        "robot_dispatched": True,
+        "has_food": True,
+        "task": task,
+    }
+    await broadcast_event(event)
+
+    return {
+        "message": "Database đã chuyển món sang dispatched. Frontend hãy gửi task trực tiếp qua HiveMQ WebSocket.",
+        **event,
+    }
+
+
+@app.post("/robot-ai/cancel-dispatch")
+async def robot_ai_cancel_dispatch(
+    data: RobotAICancelDispatchRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    rolled_back = await asyncio.to_thread(
+        rollback_frontend_dispatch,
+        data.item_id,
+        data.robot,
+        data.command_id,
+    )
+    if not rolled_back:
+        raise HTTPException(status_code=409, detail="Không thể rollback dispatch hiện tại.")
+
+    event = {
+        "type": "robot_dispatch_rolled_back",
+        "item_id": data.item_id,
+        "robot": data.robot,
+        "command_id": data.command_id,
+    }
+    await broadcast_event(event)
+    return {"message": "Đã rollback dispatch.", **event}
 
 
 @app.post("/robot-ai/dispatch")
