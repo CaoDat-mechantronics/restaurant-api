@@ -3086,6 +3086,13 @@ class RobotAISensorStateRequest(BaseModel):
     has_food: bool
 
 
+# API riêng để frontend lưu trạng thái món nhận trực tiếp từ robot.
+# Chỉ bổ sung model mới, không thay đổi RobotAISensorStateRequest/API cũ.
+class RobotAIFoodStateRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    has_food: bool
+
+
 class RobotAICancelDispatchRequest(BaseModel):
     item_id: int = Field(gt=0)
     robot: int = Field(ge=1, le=2)
@@ -3296,6 +3303,59 @@ async def robot_ai_sensor_state(
     }
     await broadcast_event(event)
     return {"message": "Đã cập nhật has_food.", "robot_state": state, **event}
+
+
+@app.post("/robot-ai/food-state")
+async def robot_ai_food_state(
+    data: RobotAIFoodStateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    API riêng để frontend lưu has_food nhận trực tiếp từ ESP32 qua topic/mon.
+
+    Frontend là nơi xác định trạng thái hiển thị từ MQTT:
+      current = 0 -> has_food = True
+      current = 1 -> has_food = False
+
+    Backend chỉ lưu trạng thái vào Firebase. Nếu giá trị trong database đã
+    giống giá trị frontend gửi lên thì không ghi lại để tránh update thừa.
+
+    Endpoint này chỉ được BỔ SUNG; các API robot-ai cũ vẫn giữ nguyên.
+    """
+
+    current_state = await asyncio.to_thread(
+        get_robot_state,
+        data.robot,
+    )
+
+    old_has_food = bool(current_state.get("has_food", False))
+    new_has_food = bool(data.has_food)
+
+    # Không ghi Firebase nếu trạng thái không thay đổi.
+    if old_has_food == new_has_food:
+        return {
+            "message": "has_food không thay đổi.",
+            "changed": False,
+            "robot": data.robot,
+            "before": old_has_food,
+            "current": new_has_food,
+            "robot_state": current_state,
+        }
+
+    state = await asyncio.to_thread(
+        update_robot_has_food,
+        data.robot,
+        new_has_food,
+    )
+
+    return {
+        "message": "Đã lưu trạng thái has_food.",
+        "changed": True,
+        "robot": data.robot,
+        "before": old_has_food,
+        "current": new_has_food,
+        "robot_state": state,
+    }
 
 
 @app.post("/robot-ai/confirm-dispatch")
