@@ -1004,6 +1004,7 @@ def require_robot_available(robot_number: int) -> dict:
     has_active_task = isinstance(current_tasks, dict) and bool(current_tasks)
 
     if has_active_task or robot_status in (
+        "received_task",
         "on_task",
         "on_target",
         "on_home",
@@ -1110,6 +1111,112 @@ def set_robot_on_task(
         }
     )
     return task
+
+
+def set_robot_received_task(
+    robot_number: int,
+    *,
+    item_id: int,
+    table_number: int,
+    food_name: str,
+    command_id: str,
+) -> dict:
+    """
+    Lưu task đã được robot nhận nhưng CHƯA bắt đầu thực thi.
+
+    Giữ riêng trạng thái received_task để phân biệt với on_task:
+      - received_task: đã nhận/lưu task, chưa chạy.
+      - on_task: đã bắt đầu thực thi nhiệm vụ.
+    """
+    route = delivery_route_for_table(table_number)
+    now_iso = utc_now_iso()
+    task = {
+        "command_id": str(command_id),
+        "item_id": int(item_id),
+        "food_name": str(food_name),
+        "table": int(table_number),
+        "junction_turn": route["junction_turn"],
+        "junction_turn_vi": route["junction_turn_vi"],
+        "line": int(route["line"]),
+        "stop_index": int(route["stop_index"]),
+        # Giữ started_at để tương thích dữ liệu/client cũ.
+        "started_at": now_iso,
+        "received_at": now_iso,
+    }
+
+    robot_ref(robot_number).update(
+        {
+            "status": "received_task",
+            "tasks": task,
+            "updated_at": now_iso,
+        }
+    )
+    return task
+
+
+def update_robot_work_status(robot_number: int, status: str) -> dict:
+    """Cập nhật riêng trạng thái công việc, không thay đổi order/menu/task data."""
+    allowed_statuses = {
+        "available",
+        "received_task",
+        "on_task",
+        "on_target",
+        "on_home",
+    }
+    normalized = str(status or "").strip().lower()
+    if normalized not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Trạng thái công việc robot không hợp lệ.")
+
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    tasks = current.get("tasks", "")
+    has_active_task = isinstance(tasks, dict) and bool(tasks)
+
+    if normalized != "available" and not has_active_task:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Robot {robot_number} chưa có task để chuyển sang {normalized}.",
+        )
+
+    # Không cho set available khi task vẫn còn, tránh tách status khỏi nhiệm vụ.
+    if normalized == "available" and has_active_task:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Robot {robot_number} vẫn còn task, chưa thể chuyển available.",
+        )
+
+    old_status = str(current.get("status") or "available").strip().lower()
+    if old_status == normalized:
+        return {
+            "changed": False,
+            "before": old_status,
+            "current": normalized,
+            "robot_state": current,
+        }
+
+    now_iso = utc_now_iso()
+    update = {
+        "status": normalized,
+        "updated_at": now_iso,
+    }
+
+    # Bổ sung thời điểm thực sự bắt đầu chạy mà không xóa field cũ.
+    if normalized == "on_task" and has_active_task:
+        task_copy = dict(tasks)
+        if not task_copy.get("execution_started_at"):
+            task_copy["execution_started_at"] = now_iso
+            update["tasks"] = task_copy
+
+    ref.update(update)
+    state = ref.get()
+    state = state if isinstance(state, dict) else {**current, **update}
+    return {
+        "changed": True,
+        "before": old_status,
+        "current": normalized,
+        "robot_state": state,
+    }
 
 
 def update_robot_has_food(robot_number: int, has_food: bool) -> dict:
@@ -2905,7 +3012,7 @@ async def dispatch_order_to_robot(
         raise
 
     task = await asyncio.to_thread(
-        set_robot_on_task,
+        set_robot_received_task,
         data.robot,
         item_id=item_id,
         table_number=table_number,
@@ -3103,6 +3210,12 @@ class RobotAIFoodStateRequest(BaseModel):
 class RobotAIAliveStateRequest(BaseModel):
     robot: int = Field(ge=1, le=2)
     alive: str = Field(min_length=1, max_length=20)
+
+
+# API riêng để frontend cập nhật trạng thái công việc của robot.
+class RobotAIWorkStatusRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    status: str = Field(min_length=1, max_length=30)
 
 
 class RobotAICancelDispatchRequest(BaseModel):
@@ -3436,6 +3549,39 @@ async def robot_ai_alive_state(
     }
 
 
+@app.post("/robot-ai/work-status")
+async def robot_ai_work_status(
+    data: RobotAIWorkStatusRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    API bổ sung, chỉ lưu work status của robot.
+    Không sửa order/menu và không thay đổi task ngoài việc thêm execution_started_at
+    khi chuyển sang on_task.
+    """
+    result = await asyncio.to_thread(
+        update_robot_work_status,
+        data.robot,
+        data.status,
+    )
+
+    event = {
+        "type": "robot_work_status",
+        "robot": data.robot,
+        "status": result["current"],
+        "changed": result["changed"],
+    }
+    if result["changed"]:
+        await broadcast_event(event)
+
+    return {
+        "message": "Đã cập nhật trạng thái công việc robot." if result["changed"] else "Trạng thái công việc không thay đổi.",
+        "robot": data.robot,
+        **result,
+        **event,
+    }
+
+
 @app.post("/robot-ai/confirm-dispatch")
 async def robot_ai_confirm_dispatch(
     data: RobotAIConfirmDispatchRequest,
@@ -3471,7 +3617,7 @@ async def robot_ai_confirm_dispatch(
     )
 
     task = await asyncio.to_thread(
-        set_robot_on_task,
+        set_robot_received_task,
         data.robot,
         item_id=data.item_id,
         table_number=data.table_number,
@@ -3575,7 +3721,7 @@ async def robot_ai_dispatch(
         raise
 
     task = await asyncio.to_thread(
-        set_robot_on_task,
+        set_robot_received_task,
         data.robot,
         item_id=data.item_id,
         table_number=data.table_number,
