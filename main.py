@@ -879,19 +879,38 @@ def delivery_route_for_table(table_number: int) -> dict:
 
 
 def ensure_robot_registry():
-    """Tạo robot_1/robot_2 nếu chưa có và bổ sung các field còn thiếu."""
+    """
+    Tạo robot_1/robot_2 nếu chưa có và bổ sung các field còn thiếu.
+
+    Cơ chế presence mới:
+      - alive: "disconnected" | "alive" được frontend cập nhật qua REST.
+      - status chỉ còn là trạng thái công việc của robot.
+
+    Khi nâng cấp từ database cũ, status="disconnected" được migrate về
+    "available" nếu không có task, hoặc "on_task" nếu vẫn còn task.
+    """
     now = utc_now_iso()
 
     for robot_number in (1, 2):
         ref = robot_ref(robot_number)
         current = ref.get()
 
-        # Robot đã tồn tại: không ghi đè dữ liệu cũ, chỉ bổ sung field mới.
         if isinstance(current, dict):
             missing_fields = {}
 
             if "has_food" not in current:
                 missing_fields["has_food"] = False
+
+            if "alive" not in current:
+                missing_fields["alive"] = "disconnected"
+
+            current_tasks = current.get("tasks", "")
+            has_active_task = isinstance(current_tasks, dict) and bool(current_tasks)
+            current_status = str(current.get("status") or "").strip().lower()
+
+            # Migrate field status cũ vốn từng trộn presence + work state.
+            if not current_status or current_status == "disconnected":
+                missing_fields["status"] = "on_task" if has_active_task else "available"
 
             if missing_fields:
                 missing_fields["updated_at"] = now
@@ -903,9 +922,12 @@ def ensure_robot_registry():
         ref.set(
             {
                 "name": f"Robot {robot_number}",
-                "status": "disconnected",
+                "alive": "disconnected",
+                "status": "available",
                 "has_food": False,
                 "tasks": "",
+                # Giữ hai field legacy để không làm vỡ client/API cũ.
+                # Presence mới không còn dựa vào chúng.
                 "wifi_connected": False,
                 "last_heartbeat": "",
                 "updated_at": now,
@@ -968,21 +990,28 @@ def refresh_robot_presence(robot_number: int) -> dict:
 
 
 def require_robot_available(robot_number: int) -> dict:
-    state = refresh_robot_presence(robot_number)
+    """
+    Kiểm tra robot có rảnh để nhận task hay không.
+
+    Presence/alive không còn được xác định bởi backend heartbeat. Hàm này chỉ
+    kiểm tra trạng thái công việc và task đang lưu, nhờ vậy các API dispatch cũ
+    vẫn hoạt động nhưng không phụ thuộc heartbeat backend.
+    """
+    state = get_robot_state(robot_number)
     robot_name = str(state.get("name") or f"Robot {robot_number}")
-    robot_status = str(state.get("status") or "disconnected")
+    robot_status = str(state.get("status") or "available").strip().lower()
+    current_tasks = state.get("tasks", "")
+    has_active_task = isinstance(current_tasks, dict) and bool(current_tasks)
 
-    if robot_status == "disconnected":
+    if has_active_task or robot_status in (
+        "on_task",
+        "on_target",
+        "on_home",
+        "come_back",
+    ):
         raise HTTPException(
             status_code=409,
-            detail=(f"{robot_name} đang disconnected hoặc đã quá "
-                    f"{ROBOT_HEARTBEAT_TIMEOUT_SECONDS} giây không có heartbeat."),
-        )
-
-    if robot_status == "on_task":
-        raise HTTPException(
-            status_code=409,
-            detail=f"{robot_name} đang thực hiện nhiệm vụ khác.",
+            detail=f"{robot_name} đang thực hiện nhiệm vụ khác (status={robot_status}).",
         )
 
     if robot_status != "available":
@@ -1150,8 +1179,6 @@ def finish_robot_task(robot_number: int, command_id: str = "") -> bool:
         {
             "status": "available",
             "tasks": "",
-            "wifi_connected": True,
-            "last_heartbeat": now_iso,
             "updated_at": now_iso,
         }
     )
@@ -1370,30 +1397,16 @@ def on_mqtt_message(client, userdata, message):
         message_status = str(payload.get("status") or "").strip().lower()
 
         # -------------------------------------------------
-        # HEARTBEAT
+        # HEARTBEAT LEGACY - KHÔNG CÒN CẬP NHẬT PRESENCE
         # -------------------------------------------------
+        # Presence mới do frontend xác định từ message MQTT của ESP32 rồi gọi
+        # POST /robot-ai/alive-state. Backend vẫn giữ subscription status để
+        # xử lý message delivered cũ, nhưng heartbeat cũ chỉ được bỏ qua.
         if message_type == "heartbeat" or message_status == "heartbeat":
-            payload_robot = payload.get("robot")
-            if payload_robot is not None and int(payload_robot) != topic_robot:
-                print("[MQTT] Bỏ qua heartbeat: robot trong payload không khớp topic")
-                return
-
-            robot_state, changed = record_robot_heartbeat(topic_robot, payload)
             print(
-                f"[ROBOT] Robot {topic_robot} heartbeat -> "
-                f"{robot_state.get('status')}"
+                f"[ROBOT] Ignore legacy backend heartbeat from robot {topic_robot}; "
+                "alive is managed by frontend."
             )
-
-            if changed:
-                broadcast_from_mqtt_thread(
-                    {
-                        "type": "robot_status",
-                        "robot": topic_robot,
-                        "status": robot_state.get("status"),
-                        "tasks": robot_state.get("tasks", ""),
-                        "wifi_connected": True,
-                    }
-                )
             return
 
         # -------------------------------------------------
@@ -1817,7 +1830,7 @@ async def cooking_status_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global fastapi_loop, cooking_task, robot_watchdog_task
+    global fastapi_loop, cooking_task
 
     init_firebase()
     validate_auth_configuration()
@@ -1838,7 +1851,7 @@ async def lifespan(app: FastAPI):
         print("[MQTT] Chưa cấu hình HiveMQ. REST/WebSocket vẫn chạy bình thường.")
 
     cooking_task = asyncio.create_task(cooking_status_worker())
-    robot_watchdog_task = asyncio.create_task(robot_watchdog_worker())
+    # Presence watchdog cũ đã tắt. Alive do frontend quản lý.
 
     try:
         yield
@@ -1847,13 +1860,6 @@ async def lifespan(app: FastAPI):
             cooking_task.cancel()
             try:
                 await cooking_task
-            except asyncio.CancelledError:
-                pass
-
-        if robot_watchdog_task is not None:
-            robot_watchdog_task.cancel()
-            try:
-                await robot_watchdog_task
             except asyncio.CancelledError:
                 pass
 
@@ -3093,6 +3099,12 @@ class RobotAIFoodStateRequest(BaseModel):
     has_food: bool
 
 
+# API riêng để frontend lưu presence do frontend heartbeat xác định.
+class RobotAIAliveStateRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    alive: str = Field(min_length=1, max_length=20)
+
+
 class RobotAICancelDispatchRequest(BaseModel):
     item_id: int = Field(gt=0)
     robot: int = Field(ge=1, le=2)
@@ -3266,8 +3278,10 @@ def robot_ai_status(current_user: dict = Depends(get_current_user)):
         "mqtt_connected": mqtt_client.is_connected() if MQTT_CONFIGURED else False,
         "total_tables": TOTAL_TABLES,
         "robots": {
-            "robot_1": refresh_robot_presence(1),
-            "robot_2": refresh_robot_presence(2),
+            # Chỉ đọc database. Endpoint này không còn tự tính heartbeat/
+            # disconnected và không ghi presence vào Firebase.
+            "robot_1": get_robot_state(1),
+            "robot_2": get_robot_state(2),
         },
     }
 
@@ -3355,6 +3369,70 @@ async def robot_ai_food_state(
         "before": old_has_food,
         "current": new_has_food,
         "robot_state": state,
+    }
+
+
+@app.post("/robot-ai/alive-state")
+async def robot_ai_alive_state(
+    data: RobotAIAliveStateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Lưu presence do frontend xác định.
+
+    Giá trị hợp lệ:
+      - alive
+      - disconnected
+
+    Endpoint không thay đổi field status/tasks và không tham gia quyết định
+    trạng thái công việc của robot. Nếu giá trị không đổi thì không ghi DB.
+    """
+    new_alive = str(data.alive or "").strip().lower()
+    if new_alive not in ("alive", "disconnected"):
+        raise HTTPException(
+            status_code=400,
+            detail="alive chỉ nhận 'alive' hoặc 'disconnected'.",
+        )
+
+    current_state = await asyncio.to_thread(get_robot_state, data.robot)
+    old_alive = str(current_state.get("alive") or "disconnected").strip().lower()
+
+    if old_alive == new_alive:
+        return {
+            "message": "alive không thay đổi.",
+            "changed": False,
+            "robot": data.robot,
+            "before": old_alive,
+            "current": new_alive,
+            "robot_state": current_state,
+        }
+
+    now_iso = utc_now_iso()
+    await asyncio.to_thread(
+        robot_ref(data.robot).update,
+        {
+            "alive": new_alive,
+            "updated_at": now_iso,
+        },
+    )
+
+    state = await asyncio.to_thread(get_robot_state, data.robot)
+
+    event = {
+        "type": "robot_alive_state",
+        "robot": data.robot,
+        "alive": new_alive,
+    }
+    await broadcast_event(event)
+
+    return {
+        "message": "Đã cập nhật alive.",
+        "changed": True,
+        "robot": data.robot,
+        "before": old_alive,
+        "current": new_alive,
+        "robot_state": state,
+        **event,
     }
 
 
