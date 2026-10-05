@@ -1009,6 +1009,7 @@ def require_robot_available(robot_number: int) -> dict:
         "on_target",
         "on_home",
         "come_back",
+        "abnormal_behavior",
     ):
         raise HTTPException(
             status_code=409,
@@ -1162,6 +1163,7 @@ def update_robot_work_status(robot_number: int, status: str) -> dict:
         "on_task",
         "on_target",
         "on_home",
+        "abnormal_behavior",
     }
     normalized = str(status or "").strip().lower()
     if normalized not in allowed_statuses:
@@ -1173,7 +1175,7 @@ def update_robot_work_status(robot_number: int, status: str) -> dict:
     tasks = current.get("tasks", "")
     has_active_task = isinstance(tasks, dict) and bool(tasks)
 
-    if normalized != "available" and not has_active_task:
+    if normalized not in ("available", "abnormal_behavior") and not has_active_task:
         raise HTTPException(
             status_code=409,
             detail=f"Robot {robot_number} chưa có task để chuyển sang {normalized}.",
@@ -3587,8 +3589,9 @@ async def robot_ai_confirm_dispatch(
     data: RobotAIConfirmDispatchRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    # Endpoint này CHỈ cập nhật database.
-    # Frontend sẽ publish task/motor trực tiếp tới HiveMQ bằng MQTT over WebSocket.
+    # Endpoint này CHỈ commit nhiệm vụ vào database.
+    # ESP32 không nhận nội dung task; frontend giữ route/task và chỉ gửi
+    # lệnh điều khiển tức thời qua topic/status khi người dùng bắt đầu chạy.
     if not data.has_food:
         raise HTTPException(status_code=409, detail="Chưa có món trên robot (has_food=false).")
 
@@ -3643,7 +3646,7 @@ async def robot_ai_confirm_dispatch(
     await broadcast_event(event)
 
     return {
-        "message": "Database đã chuyển món sang dispatched. Frontend hãy gửi task trực tiếp qua HiveMQ WebSocket.",
+        "message": "Database đã chuyển món sang dispatched và robot sang RECEIVED TASK. ESP32 chỉ nhận lệnh điều khiển từ frontend qua topic/status.",
         **event,
     }
 
