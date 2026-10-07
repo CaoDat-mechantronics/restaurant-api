@@ -104,6 +104,9 @@ class OrderCreate(BaseModel):
 
 class DeliveryUpdate(BaseModel):
     delivered: bool
+    # Khi True, chỉ cập nhật món sang delivered nhưng giữ nguyên task robot.
+    # Luồng giao món mới chỉ clear task sau khi robot đã về waiting station.
+    keep_robot_task: bool = False
 
 
 class QuantityUpdate(BaseModel):
@@ -1369,6 +1372,180 @@ def rollback_frontend_dispatch(item_id: int, robot_number: int, command_id: str)
     return True
 
 
+def replace_received_food_delivery_task(
+    robot_number: int,
+    *,
+    old_command_id: str,
+    new_item_id: int,
+    new_table_number: int,
+    has_food: bool,
+) -> dict:
+    """
+    Thay task khi robot vẫn ở received_task và CHƯA chạy.
+
+    Frontend chỉ gọi hàm này sau khi quản lý đã xác nhận thay task, món cũ
+    đã được lấy khỏi robot và món mới đã được đặt lên robot. Không tạo thêm
+    work status mới; robot vẫn ở received_task.
+    """
+    if not has_food:
+        raise HTTPException(status_code=409, detail="Chưa có món mới trên robot.")
+
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    status = str(current.get("status") or "available").strip().lower()
+    old_task = current.get("tasks")
+
+    if status != "received_task" or not isinstance(old_task, dict) or not old_task:
+        raise HTTPException(
+            status_code=409,
+            detail="Robot không còn ở trạng thái RECEIVED TASK để thay nhiệm vụ.",
+        )
+
+    active_command_id = str(old_task.get("command_id") or "").strip()
+    if active_command_id != str(old_command_id or "").strip():
+        raise HTTPException(status_code=409, detail="Task hiện tại đã thay đổi, hãy đọc lại trạng thái robot.")
+
+    old_item_id = int(old_task.get("item_id") or 0)
+    if old_item_id <= 0:
+        raise HTTPException(status_code=409, detail="Task cũ không có item_id hợp lệ.")
+
+    if int(new_item_id) == old_item_id:
+        raise HTTPException(status_code=409, detail="Nhiệm vụ mới trùng với nhiệm vụ hiện tại.")
+
+    new_item = get_item(new_item_id)
+    if new_item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món mới.")
+    if int(new_item["table_number"]) != int(new_table_number):
+        raise HTTPException(status_code=409, detail="Món mới không thuộc bàn được yêu cầu.")
+    if bool(new_item["delivered"]):
+        raise HTTPException(status_code=409, detail="Món mới đã được giao.")
+    if bool(new_item["robot_dispatched"]):
+        raise HTTPException(status_code=409, detail="Món mới đã được dispatch trước đó.")
+    if int(new_item.get("cooking_status") or 0) < 2:
+        raise HTTPException(status_code=409, detail="Món mới chưa nấu xong nên chưa thể giao.")
+
+    old_item = get_item(old_item_id)
+    if old_item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món của task cũ.")
+    if str(old_item.get("dispatch_command_id") or "") != active_command_id:
+        raise HTTPException(status_code=409, detail="Dispatch của món cũ không còn khớp task hiện tại.")
+    if bool(old_item.get("delivered")):
+        raise HTTPException(status_code=409, detail="Món của task cũ đã được giao, không thể thay task.")
+
+    new_command_id = uuid.uuid4().hex[:8].upper()
+    route = robot_ai_calculate_route(new_table_number)
+
+    # Chỉ rollback món cũ sau khi món mới đã được validate hoàn toàn.
+    item_ref(old_item_id).update(
+        {
+            "assigned_robot": None,
+            "robot_dispatched": False,
+            "delivery_status": "waiting",
+            "dispatch_command_id": None,
+        }
+    )
+
+    try:
+        prepare_robot_dispatch(new_item_id, robot_number, new_command_id)
+        task = set_robot_received_task(
+            robot_number,
+            item_id=new_item_id,
+            table_number=new_table_number,
+            food_name=new_item["food_name"],
+            command_id=new_command_id,
+        )
+        update_robot_has_food(robot_number, True)
+    except Exception:
+        # Best-effort rollback để không làm mất task cũ nếu ghi task mới lỗi.
+        try:
+            item_ref(new_item_id).update(
+                {
+                    "assigned_robot": None,
+                    "robot_dispatched": False,
+                    "delivery_status": "waiting",
+                    "dispatch_command_id": None,
+                }
+            )
+        except Exception:
+            pass
+        try:
+            item_ref(old_item_id).update(
+                {
+                    "assigned_robot": robot_number,
+                    "robot_dispatched": True,
+                    "delivery_status": "dispatched",
+                    "dispatch_command_id": active_command_id,
+                }
+            )
+            ref.update(
+                {
+                    "status": "received_task",
+                    "tasks": old_task,
+                    "updated_at": utc_now_iso(),
+                }
+            )
+        except Exception:
+            pass
+        raise
+
+    return {
+        "old_task": dict(old_task),
+        "old_item_id": old_item_id,
+        "command_id": new_command_id,
+        "task": task,
+        "route": route,
+        "food_name": new_item["food_name"],
+        "table": int(new_table_number),
+    }
+
+
+def complete_robot_food_delivery_task(
+    robot_number: int,
+    *,
+    command_id: str,
+    item_id: int,
+) -> dict:
+    """Chỉ clear task sau khi món đã delivered và robot đã về waiting station."""
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+    status = str(current.get("status") or "available").strip().lower()
+    task = current.get("tasks")
+
+    if status != "on_home":
+        raise HTTPException(
+            status_code=409,
+            detail="Robot chưa ở trạng thái ON HOME để hoàn tất task.",
+        )
+    if not isinstance(task, dict) or not task:
+        raise HTTPException(status_code=409, detail="Robot không còn task để hoàn tất.")
+
+    active_command_id = str(task.get("command_id") or "").strip()
+    if active_command_id != str(command_id or "").strip():
+        raise HTTPException(status_code=409, detail="command_id không khớp task hiện tại.")
+    if int(task.get("item_id") or 0) != int(item_id):
+        raise HTTPException(status_code=409, detail="item_id không khớp task hiện tại.")
+
+    item = get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy món vừa giao.")
+    if not bool(item.get("delivered")) or str(item.get("delivery_status") or "") != "delivered":
+        raise HTTPException(
+            status_code=409,
+            detail="Món chưa được cập nhật sang ĐÃ GIAO nên chưa thể xóa task.",
+        )
+
+    if not finish_robot_task(robot_number, command_id):
+        raise HTTPException(status_code=409, detail="Không thể kết thúc task hiện tại.")
+
+    state = get_robot_state(robot_number)
+    return {
+        "completed_task": dict(task),
+        "robot_state": state,
+    }
+
+
 def reset_robot_to_initial_work_state(robot_number: int) -> dict:
     """
     Reset nhiệm vụ của robot về trạng thái công việc ban đầu.
@@ -1711,6 +1888,20 @@ def on_mqtt_message(client, userdata, message):
         expected_command_id = str(item.get("dispatch_command_id") or "")
         if expected_command_id and command_id != expected_command_id:
             print("[MQTT] Bỏ qua: command_id cũ hoặc không hợp lệ")
+            return
+
+        # Luồng food_delivery mới do frontend điều phối toàn bộ lifecycle:
+        # on_target -> on_home -> waiting station -> PATCH delivered -> complete-task.
+        # Vì vậy một gói MQTT delivered legacy không được phép đánh dấu món/xóa
+        # task sớm. Chỉ giữ nhánh cũ cho task legacy chưa có task_type.
+        robot_state = get_robot_state(robot_number)
+        active_task = robot_state.get("tasks") if isinstance(robot_state, dict) else None
+        if (
+            isinstance(active_task, dict)
+            and str(active_task.get("task_type") or "").strip().lower() == "food_delivery"
+            and str(active_task.get("command_id") or "") == command_id
+        ):
+            print("[MQTT] Bỏ qua delivered legacy: food_delivery mới chỉ complete tại waiting station")
             return
 
         # QoS 1 có thể gửi lặp. Nếu đã delivered thì vẫn cho robot trở về
@@ -2694,7 +2885,11 @@ def get_order_by_code(order_code: str):
 # PATCH /order-items/{item_id}/delivered
 # =========================================================
 
-def update_delivery_status_in_firebase(item_id: int, delivered: bool):
+def update_delivery_status_in_firebase(
+    item_id: int,
+    delivered: bool,
+    keep_robot_task: bool = False,
+):
     item = get_item(item_id)
 
     if item is None:
@@ -2711,7 +2906,15 @@ def update_delivery_status_in_firebase(item_id: int, delivered: bool):
         }
     )
 
-    if bool(delivered) and item.get("assigned_robot") is not None:
+    # Tương thích API cũ: mặc định PATCH delivered=true vẫn có thể kết thúc
+    # task như trước. Riêng luồng robot mới truyền keep_robot_task=true để
+    # món chuyển "đang giao" -> "đã giao" trước, rồi gọi complete-task
+    # sau đó mới xóa task và đưa robot về available.
+    if (
+        bool(delivered)
+        and not bool(keep_robot_task)
+        and item.get("assigned_robot") is not None
+    ):
         finish_robot_task(
             int(item["assigned_robot"]),
             str(item.get("dispatch_command_id") or ""),
@@ -2730,6 +2933,7 @@ async def update_delivery_status(
         update_delivery_status_in_firebase,
         item_id,
         data.delivered,
+        data.keep_robot_task,
     )
 
     await broadcast_event(
@@ -3382,6 +3586,20 @@ class RobotAIResetRequest(BaseModel):
     robot: int = Field(ge=1, le=2)
 
 
+class RobotAIReplaceDispatchRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    old_command_id: str = Field(min_length=1, max_length=64)
+    new_item_id: int = Field(gt=0)
+    new_table_number: int = Field(ge=1, le=TOTAL_TABLES)
+    has_food: bool
+
+
+class RobotAICompleteTaskRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+    command_id: str = Field(min_length=1, max_length=64)
+    item_id: int = Field(gt=0)
+
+
 class RobotAIMapTableConfig(BaseModel):
     table: int = Field(ge=1, le=TOTAL_TABLES)
     line: int = Field(ge=1, le=2)
@@ -3769,6 +3987,65 @@ async def robot_ai_work_status(
         "robot": data.robot,
         **result,
         **event,
+    }
+
+
+@app.post("/robot-ai/replace-dispatch")
+async def robot_ai_replace_dispatch(
+    data: RobotAIReplaceDispatchRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    result = await asyncio.to_thread(
+        replace_received_food_delivery_task,
+        data.robot,
+        old_command_id=data.old_command_id,
+        new_item_id=data.new_item_id,
+        new_table_number=data.new_table_number,
+        has_food=data.has_food,
+    )
+
+    event = {
+        "type": "robot_task_replaced",
+        "robot": data.robot,
+        "status": "received_task",
+        "command_id": result["command_id"],
+        "food_name": result["food_name"],
+        "table": result["table"],
+        "route": result["route"],
+        "task": result["task"],
+        "old_task": result["old_task"],
+    }
+    await broadcast_event(event)
+    return {
+        "message": "Đã thay nhiệm vụ cũ bằng nhiệm vụ mới. Robot vẫn ở RECEIVED TASK.",
+        **event,
+    }
+
+
+@app.post("/robot-ai/complete-task")
+async def robot_ai_complete_task(
+    data: RobotAICompleteTaskRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    result = await asyncio.to_thread(
+        complete_robot_food_delivery_task,
+        data.robot,
+        command_id=data.command_id,
+        item_id=data.item_id,
+    )
+
+    event = {
+        "type": "robot_task_completed",
+        "robot": data.robot,
+        "status": "available",
+        "tasks": "",
+        "completed_task": result["completed_task"],
+    }
+    await broadcast_event(event)
+    return {
+        "message": "Đã hoàn tất task: robot AVAILABLE và tasks đã được xóa.",
+        **event,
+        "robot_state": result["robot_state"],
     }
 
 
