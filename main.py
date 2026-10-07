@@ -311,6 +311,10 @@ def robot_ref(robot_number: int):
     return db.reference(firebase_path(f"robot/robot_{int(robot_number)}"))
 
 
+def robot_map_ref():
+    return db.reference(firebase_path("map"))
+
+
 # =========================================================
 # AUTH / JWT / ROLE HELPERS
 # =========================================================
@@ -854,28 +858,119 @@ def robot_number_from_status_topic(topic: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def delivery_route_for_table(table_number: int) -> dict:
+def default_table_line_map() -> dict[int, int]:
+    return {
+        table_number: (1 if table_number <= 5 else 2)
+        for table_number in range(1, TOTAL_TABLES + 1)
+    }
+
+
+def get_table_line_map() -> dict[int, int]:
+    table_lines = default_table_line_map()
+
+    try:
+        stored = robot_map_ref().child("table_lines").get()
+    except Exception:
+        stored = None
+
+    if isinstance(stored, dict):
+        for raw_table, raw_line in stored.items():
+            try:
+                table_number = int(raw_table)
+                line = int(raw_line)
+            except (TypeError, ValueError):
+                continue
+
+            if 1 <= table_number <= TOTAL_TABLES and line in (1, 2):
+                table_lines[table_number] = line
+
+    return table_lines
+
+
+def map_routes_payload() -> dict:
+    table_lines = get_table_line_map()
+    routes = []
+
+    for table_number in range(1, TOTAL_TABLES + 1):
+        routes.append(delivery_route_for_table(table_number, table_lines=table_lines))
+
+    try:
+        map_data = robot_map_ref().get()
+    except Exception:
+        map_data = None
+
+    return {
+        "total_tables": TOTAL_TABLES,
+        "tables": routes,
+        "updated_at": map_data.get("updated_at") if isinstance(map_data, dict) else None,
+    }
+
+
+def save_table_line_map(entries) -> dict:
+    table_lines = {}
+
+    for entry in entries:
+        table_number = int(entry.table)
+        line = int(entry.line)
+
+        if table_number in table_lines:
+            raise HTTPException(status_code=400, detail=f"Bàn {table_number} bị khai báo trùng.")
+        if line not in (1, 2):
+            raise HTTPException(status_code=400, detail="Line chỉ nhận giá trị 1 hoặc 2.")
+
+        table_lines[table_number] = line
+
+    expected_tables = set(range(1, TOTAL_TABLES + 1))
+    if set(table_lines.keys()) != expected_tables:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Map phải cấu hình đủ bàn 1 đến bàn {TOTAL_TABLES}.",
+        )
+
+    now_iso = utc_now_iso()
+    robot_map_ref().set(
+        {
+            "table_lines": {
+                str(table_number): int(table_lines[table_number])
+                for table_number in sorted(table_lines)
+            },
+            "updated_at": now_iso,
+        }
+    )
+
+    return map_routes_payload()
+
+
+def delivery_route_for_table(table_number: int, table_lines: dict[int, int] | None = None) -> dict:
     table_number = int(table_number)
 
-    if 1 <= table_number <= 5:
-        return {
-            "table": table_number,
-            "line": 1,
-            "junction_turn": "LEFT",
-            "junction_turn_vi": "Rẽ trái",
-            "stop_index": table_number,
-        }
+    if table_number < 1 or table_number > TOTAL_TABLES:
+        raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
 
-    if 6 <= table_number <= 10:
-        return {
-            "table": table_number,
-            "line": 2,
-            "junction_turn": "RIGHT",
-            "junction_turn_vi": "Rẽ phải",
-            "stop_index": table_number - 5,
-        }
+    table_lines = table_lines or get_table_line_map()
+    line = int(table_lines.get(table_number, default_table_line_map()[table_number]))
 
-    raise HTTPException(status_code=400, detail="Số bàn không hợp lệ.")
+    if line not in (1, 2):
+        line = 1 if table_number <= 5 else 2
+
+    tables_on_line = sorted(
+        table
+        for table, configured_line in table_lines.items()
+        if int(configured_line) == line and 1 <= int(table) <= TOTAL_TABLES
+    )
+
+    try:
+        stop_index = tables_on_line.index(table_number) + 1
+    except ValueError:
+        stop_index = 1
+
+    return {
+        "table": table_number,
+        "line": line,
+        "junction_turn": "LEFT" if line == 1 else "RIGHT",
+        "junction_turn_vi": "Rẽ trái" if line == 1 else "Rẽ phải",
+        "stop_index": stop_index,
+    }
 
 
 def ensure_robot_registry():
@@ -1094,6 +1189,7 @@ def set_robot_on_task(
     now_iso = utc_now_iso()
     task = {
         "command_id": str(command_id),
+        "task_type": "food_delivery",
         "item_id": int(item_id),
         "food_name": str(food_name),
         "table": int(table_number),
@@ -1133,6 +1229,7 @@ def set_robot_received_task(
     now_iso = utc_now_iso()
     task = {
         "command_id": str(command_id),
+        "task_type": "food_delivery",
         "item_id": int(item_id),
         "food_name": str(food_name),
         "table": int(table_number),
@@ -3220,6 +3317,15 @@ class RobotAIWorkStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=30)
 
 
+class RobotAIMapTableConfig(BaseModel):
+    table: int = Field(ge=1, le=TOTAL_TABLES)
+    line: int = Field(ge=1, le=2)
+
+
+class RobotAIMapUpdateRequest(BaseModel):
+    tables: list[RobotAIMapTableConfig]
+
+
 class RobotAICancelDispatchRequest(BaseModel):
     item_id: int = Field(gt=0)
     robot: int = Field(ge=1, le=2)
@@ -3381,6 +3487,23 @@ def robot_ai_create_ephemeral_token() -> dict:
         "model": GEMINI_LIVE_MODEL,
         "expire_time": rfc3339(expire_time),
         "new_session_expire_time": rfc3339(new_session_expire_time),
+    }
+
+
+@app.get("/robot-ai/map")
+def robot_ai_get_map(current_user: dict = Depends(get_current_user)):
+    return map_routes_payload()
+
+
+@app.put("/robot-ai/map")
+async def robot_ai_update_map(
+    data: RobotAIMapUpdateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    result = await asyncio.to_thread(save_table_line_map, data.tables)
+    return {
+        "message": "Đã cập nhật Map bàn / Line.",
+        **result,
     }
 
 
