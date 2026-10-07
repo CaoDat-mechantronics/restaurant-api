@@ -1369,6 +1369,67 @@ def rollback_frontend_dispatch(item_id: int, robot_number: int, command_id: str)
     return True
 
 
+def reset_robot_to_initial_work_state(robot_number: int) -> dict:
+    """
+    Reset nhiệm vụ của robot về trạng thái công việc ban đầu.
+
+    - status -> available
+    - tasks -> ""
+    - giữ nguyên alive và has_food vì đây là trạng thái kết nối/cảm biến vật lý
+    - food_delivery chưa delivered sẽ rollback item về waiting để có thể giao lại
+    """
+    ref = robot_ref(robot_number)
+    current = ref.get()
+    current = current if isinstance(current, dict) else {}
+
+    previous_status = str(current.get("status") or "available").strip().lower()
+    task = current.get("tasks")
+    task_copy = dict(task) if isinstance(task, dict) else {}
+    item_rolled_back = False
+
+    if task_copy:
+        task_type = str(task_copy.get("task_type") or "food_delivery").strip().lower()
+        item_id = task_copy.get("item_id")
+        command_id = str(task_copy.get("command_id") or "").strip()
+
+        # Task legacy chưa có task_type đều là giao món.
+        if task_type == "food_delivery" and item_id and command_id:
+            try:
+                item_rolled_back = bool(
+                    rollback_frontend_dispatch(
+                        int(item_id),
+                        int(robot_number),
+                        command_id,
+                    )
+                )
+            except (TypeError, ValueError):
+                item_rolled_back = False
+
+    now_iso = utc_now_iso()
+    ref.update(
+        {
+            "status": "available",
+            "tasks": "",
+            "updated_at": now_iso,
+        }
+    )
+
+    state = ref.get()
+    state = state if isinstance(state, dict) else {
+        **current,
+        "status": "available",
+        "tasks": "",
+        "updated_at": now_iso,
+    }
+
+    return {
+        "before_status": previous_status,
+        "before_task": task_copy,
+        "item_rolled_back": item_rolled_back,
+        "robot_state": state,
+    }
+
+
 def finish_robot_task(robot_number: int, command_id: str = "") -> bool:
     ref = robot_ref(robot_number)
     current = ref.get()
@@ -3317,6 +3378,10 @@ class RobotAIWorkStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=30)
 
 
+class RobotAIResetRequest(BaseModel):
+    robot: int = Field(ge=1, le=2)
+
+
 class RobotAIMapTableConfig(BaseModel):
     table: int = Field(ge=1, le=TOTAL_TABLES)
     line: int = Field(ge=1, le=2)
@@ -3701,6 +3766,34 @@ async def robot_ai_work_status(
 
     return {
         "message": "Đã cập nhật trạng thái công việc robot." if result["changed"] else "Trạng thái công việc không thay đổi.",
+        "robot": data.robot,
+        **result,
+        **event,
+    }
+
+
+@app.post("/robot-ai/reset")
+async def robot_ai_reset(
+    data: RobotAIResetRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Reset task/work-state của robot sau khi frontend đã confirm với người dùng."""
+    result = await asyncio.to_thread(
+        reset_robot_to_initial_work_state,
+        data.robot,
+    )
+
+    event = {
+        "type": "robot_reset",
+        "robot": data.robot,
+        "status": "available",
+        "tasks": "",
+        "item_rolled_back": bool(result["item_rolled_back"]),
+    }
+    await broadcast_event(event)
+
+    return {
+        "message": "Đã reset robot: xóa task và đưa Work về AVAILABLE.",
         "robot": data.robot,
         **result,
         **event,
