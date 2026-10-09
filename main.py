@@ -3632,16 +3632,18 @@ def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
 
     items = get_items_by_table(table_number)
     requested_norm = robot_ai_normalize_food_name(requested_food)
+    route = robot_ai_calculate_route(table_number)
 
-    pending = [item for item in items if not bool(item.get("delivered"))]
-    exact = [
-        item for item in pending
-        if robot_ai_normalize_food_name(item.get("food_name", "")) == requested_norm
-    ]
+    def find_matches(source_items: list[dict]) -> list[dict]:
+        exact_matches = [
+            item for item in source_items
+            if robot_ai_normalize_food_name(item.get("food_name", "")) == requested_norm
+        ]
+        if exact_matches:
+            return exact_matches
 
-    if not exact:
         substring = [
-            item for item in pending
+            item for item in source_items
             if requested_norm and (
                 requested_norm in robot_ai_normalize_food_name(item.get("food_name", ""))
                 or robot_ai_normalize_food_name(item.get("food_name", "")) in requested_norm
@@ -3651,17 +3653,44 @@ def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
             robot_ai_normalize_food_name(item.get("food_name", ""))
             for item in substring
         }
-        if len(unique_names) == 1:
-            exact = substring
+        return substring if len(unique_names) == 1 else []
+
+    pending = [item for item in items if not bool(item.get("delivered"))]
+    exact = find_matches(pending)
 
     available_foods = sorted({
         str(item.get("food_name") or "")
         for item in pending
         if str(item.get("food_name") or "").strip()
     })
-    route = robot_ai_calculate_route(table_number)
 
+    # Trước đây món đã giao bị loại khỏi pending rồi bị trả lời thành
+    # "bàn không có món". Bây giờ phân biệt rõ: món CÓ trong bàn nhưng đã giao.
     if not exact:
+        all_matches = find_matches(items)
+        delivered_matches = [item for item in all_matches if bool(item.get("delivered"))]
+
+        if delivered_matches:
+            delivered_matches.sort(
+                key=lambda item: int(item.get("id") or 0),
+                reverse=True,
+            )
+            item = delivered_matches[0]
+            return {
+                "found": True,
+                "deliverable": False,
+                "table_number": table_number,
+                "requested_food": requested_food,
+                "item": item,
+                "route": route,
+                "available_foods": available_foods,
+                "reason": "already_delivered",
+                "message": (
+                    f"Bàn {table_number} có món '{item.get('food_name') or requested_food}' "
+                    "nhưng món này đã được giao rồi."
+                ),
+            }
+
         normalized_map = {
             robot_ai_normalize_food_name(name): name
             for name in available_foods
@@ -3683,6 +3712,7 @@ def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
             "available_foods": available_foods,
             "suggestions": suggestions,
             "route": route,
+            "reason": "not_found",
             "message": f"Bàn {table_number} không có món '{requested_food}' trong các món chưa giao.",
         }
 
@@ -3701,12 +3731,16 @@ def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
     deliverable = cooking_status >= 2 and not dispatched and not delivered
 
     if cooking_status < 2:
+        reason = "not_cooked"
         message = "Món có trong đơn nhưng chưa nấu xong."
     elif dispatched:
+        reason = "already_dispatched"
         message = "Món đã được dispatch trước đó."
     elif delivered:
+        reason = "already_delivered"
         message = "Món đã được giao."
     else:
+        reason = "ready"
         message = "Món đã sẵn sàng để giao."
 
     return {
@@ -3717,6 +3751,7 @@ def robot_ai_find_food(table_number: int, requested_food: str) -> dict:
         "item": item,
         "route": route,
         "available_foods": available_foods,
+        "reason": reason,
         "message": message,
     }
 
